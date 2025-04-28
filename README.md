@@ -58,6 +58,7 @@ Based on the exploratory data analysis, here are key findings about the transfor
    - Multi-step forecasting may be possible given the strong patterns
    - Feature importance analysis should be performed to select most relevant features
    - The strong autocorrelation suggests that even simple models like ARIMA might perform reasonably well as baselines
+   - Although ARIMA could perform well, LSTM is a better choice over all
 
 7. **Key Insights for Feature Engineering**:
    - The ratio between useful and useless loads appears significant
