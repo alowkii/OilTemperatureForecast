@@ -1,3 +1,42 @@
+## Folders structure
+
+OilTempearatureForecast
+├── Env
+├── Data
+│ ├── raw
+│ ├── preprocessed
+│ └── features
+├── models
+├── notebooks
+├── src
+│ ├── data
+│ ├── features
+│ ├── models
+│ ├── visualization
+│ └── utils
+├── requirements.txt
+├── README.md
+├── .gitignore
+├── setup.py
+
+## Pre-requisites
+
+This project is designed to be run in a Python 3.13.1 environment. It is recommended to use a virtual environment to avoid conflicts with other projects.
+
+Windows:
+
+```bash
+python -m venv Env
+.\Env\Scripts\activate
+```
+
+or on Linux/Mac:
+
+```bash
+python -m venv Env
+source venv/bin/activate
+```
+
 ## 1. Install requirements
 
 Python version: Python 3.13.1
