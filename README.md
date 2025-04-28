@@ -1,14 +1,14 @@
-#### 1. Install requirements
+## 1. Install requirements
 
 Python version: Python 3.13.1
 
-## Run:
+### Run:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-#### 2. EDA at:
+## 2. EDA at:
 
 ./notebooks/data_exploration.ipynb
 
@@ -66,9 +66,9 @@ Based on the exploratory data analysis, here are key findings about the transfor
    - Historical values of oil temperature (lagged features) will be crucial predictors
    - Time of day and day of week encode important cyclical patterns
 
-#### 3. Preprocess files:
+## 3. Preprocess files:
 
-## Run:
+### Run:
 
 ```bash
 python -m src.data.make_dataset
