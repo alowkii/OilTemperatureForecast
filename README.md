@@ -1,5 +1,6 @@
 ## Folders structure
 
+<pre>```
 OilTempearatureForecast
 ├── Env
 ├── Data
@@ -17,7 +18,8 @@ OilTempearatureForecast
 ├── requirements.txt
 ├── README.md
 ├── .gitignore
-├── setup.py
+└── setup.py
+```</pre>
 
 ## Pre-requisites
 
