@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from typing import Optional, Tuple, Dict, Union
+import json
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -197,26 +198,51 @@ def preprocess_data(
     
     # Handle outliers
     if handle_outliers:
-        logger.info("Detecting and handling outliers")
+        logger.info("Detecting and handling outliers with improved method")
         for column in processed_df.select_dtypes(include=[np.number]).columns:
             # Skip columns with NaN values for outlier detection
             if processed_df[column].isnull().any():
                 logger.warning(f"Column '{column}' has NaN values, skipping outlier detection")
                 continue
                 
-            # Calculate z-scores
-            z_scores = np.abs((processed_df[column] - processed_df[column].mean()) / processed_df[column].std())
+            # Instead of using a simple z-score approach, use a more robust method
+            # Calculate IQR (Interquartile Range)
+            Q1 = processed_df[column].quantile(0.25)
+            Q3 = processed_df[column].quantile(0.75)
+            IQR = Q3 - Q1
             
-            # Identify outliers (z-score > 3)
-            outliers = z_scores > 3
-            
-            if outliers.sum() > 0:
-                logger.info(f"Found {outliers.sum()} outliers in column '{column}'")
+            # Define less aggressive bounds for extreme values in oil temperature
+            if column == 'OT':  # Oil Temperature column
+                # Use a more permissive threshold for the target variable
+                lower_bound = Q1 - 3.0 * IQR
+                upper_bound = Q3 + 3.0 * IQR
                 
-                # Replace outliers with column median as a safer approach
-                column_median = processed_df[column].median()
-                processed_df.loc[outliers, column] = column_median
-                logger.info(f"Replaced outliers in '{column}' with median value: {column_median}")
+                # Identify outliers
+                outliers = (processed_df[column] < lower_bound) | (processed_df[column] > upper_bound)
+                
+                if outliers.sum() > 0:
+                    logger.info(f"Found {outliers.sum()} outliers in oil temperature column '{column}'")
+                    
+                    # For extreme temperatures, instead of replacing with median,
+                    # cap the values at the bounds to preserve the extreme nature
+                    processed_df.loc[processed_df[column] < lower_bound, column] = lower_bound
+                    processed_df.loc[processed_df[column] > upper_bound, column] = upper_bound
+                    logger.info(f"Capped extreme values in '{column}' at bounds: [{lower_bound:.2f}, {upper_bound:.2f}]")
+            else:
+                # For other columns, use standard IQR method but with 2.5 instead of 1.5 for flexibility
+                lower_bound = Q1 - 2.5 * IQR
+                upper_bound = Q3 + 2.5 * IQR
+                
+                # Identify outliers
+                outliers = (processed_df[column] < lower_bound) | (processed_df[column] > upper_bound)
+                
+                if outliers.sum() > 0:
+                    logger.info(f"Found {outliers.sum()} outliers in column '{column}'")
+                    
+                    # Replace outliers with column median
+                    column_median = processed_df[column].median()
+                    processed_df.loc[outliers, column] = column_median
+                    logger.info(f"Replaced outliers in '{column}' with median value: {column_median}")
     
     # Resample time series if needed
     if resample_freq is not None:
@@ -357,8 +383,31 @@ def process_file(input_path: str, output_path: str) -> None:
     # Load data
     df = load_data(input_path)
     
+    # Analyze temperature distribution before preprocessing
+    if 'OT' in df.columns:
+        logger.info("Analyzing temperature distribution in raw data")
+        raw_temp_stats = analyze_temperature_distribution(df, target_column='OT')
+        
+        # Save temperature statistics
+        stats_dir = os.path.dirname(output_path)
+        stats_file = os.path.join(stats_dir, 'temperature_stats.json')
+        with open(stats_file, 'w') as f:
+            json.dump(raw_temp_stats, f, indent=4)
+        logger.info(f"Temperature statistics saved to {stats_file}")
+    
     # Preprocess data
     processed_df = preprocess_data(df)
+    
+    # Analyze temperature distribution after preprocessing
+    if 'OT' in processed_df.columns:
+        logger.info("Analyzing temperature distribution after preprocessing")
+        processed_temp_stats = analyze_temperature_distribution(processed_df, target_column='OT')
+        
+        # Log any significant changes in distribution
+        if raw_temp_stats['p95'] != processed_temp_stats['p95']:
+            logger.info(f"95th percentile changed from {raw_temp_stats['p95']:.2f} to {processed_temp_stats['p95']:.2f}")
+        if raw_temp_stats['max'] != processed_temp_stats['max']:
+            logger.info(f"Maximum temperature changed from {raw_temp_stats['max']:.2f} to {processed_temp_stats['max']:.2f}")
     
     # Create time features
     processed_df = create_time_features(processed_df)
@@ -368,6 +417,62 @@ def process_file(input_path: str, output_path: str) -> None:
     
     logger.info(f"Processing completed for {input_path}")
     return processed_df
+
+def analyze_temperature_distribution(df: pd.DataFrame, target_column: str = 'OT') -> Dict[str, float]:
+    """
+    Analyze temperature distribution to identify important thresholds for preprocessing.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame containing temperature data
+    target_column : str, optional
+        Name of the temperature column, by default 'OT'
+        
+    Returns
+    -------
+    Dict[str, float]
+        Dictionary with thresholds and distribution statistics
+    """
+    if target_column not in df.columns:
+        logger.warning(f"Target column '{target_column}' not found in DataFrame")
+        return {}
+    
+    logger.info(f"Analyzing temperature distribution for column '{target_column}'")
+    
+    # Get temperature values
+    temps = df[target_column].dropna()
+    
+    # Calculate statistics
+    stats = {
+        'min': float(temps.min()),
+        'max': float(temps.max()),
+        'mean': float(temps.mean()),
+        'median': float(temps.median()),
+        'std': float(temps.std()),
+        'q1': float(temps.quantile(0.25)),
+        'q3': float(temps.quantile(0.75)),
+        # Extreme thresholds
+        'p90': float(temps.quantile(0.90)),  # 90th percentile
+        'p95': float(temps.quantile(0.95)),  # 95th percentile
+        'p99': float(temps.quantile(0.99)),  # 99th percentile
+        # Low thresholds
+        'p10': float(temps.quantile(0.10)),  # 10th percentile
+        'p5': float(temps.quantile(0.05)),   # 5th percentile
+        'p1': float(temps.quantile(0.01))    # 1st percentile
+    }
+    
+    # Calculate IQR and bounds
+    stats['iqr'] = stats['q3'] - stats['q1']
+    stats['lower_bound'] = stats['q1'] - 3.0 * stats['iqr']
+    stats['upper_bound'] = stats['q3'] + 3.0 * stats['iqr']
+    
+    # Log important statistics
+    logger.info(f"Temperature range: {stats['min']:.2f} to {stats['max']:.2f}")
+    logger.info(f"Temperature mean: {stats['mean']:.2f}, median: {stats['median']:.2f}")
+    logger.info(f"Extreme temperature threshold (p95): {stats['p95']:.2f}")
+    
+    return stats
 
 def main(train_input_path: str, test_input_path: str, train_output_path: str, test_output_path: str) -> None:
     """

@@ -21,14 +21,190 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"  # Disable oneDNN optimizations for re
 
 import tensorflow as tf
 from tensorflow.keras.models import Sequential, Model, load_model
-from tensorflow.keras.layers import Dense, LSTM, Dropout, GRU, Bidirectional, Input, Concatenate
+from tensorflow.keras.layers import Dense, LSTM, Dropout, Attention, Bidirectional, Input, Concatenate, Flatten
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler
+
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.data.make_dataset import analyze_temperature_distribution
 
 # Configure logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+def preprocess_with_enhanced_scaling(
+    df: pd.DataFrame,
+    target_column: str = 'OT',
+    scaling_method: str = 'robust',
+    include_extremes_analysis: bool = True,
+    temp_stats_path: Optional[str] = None  # Add this parameter
+) -> Tuple[pd.DataFrame, Any, Dict[str, Any]]:
+    """
+    Enhanced preprocessing with better scaling and extreme value handling.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input DataFrame with features
+    target_column : str, optional
+        Target column name, by default 'OT'
+    scaling_method : str, optional
+        Scaling method to use ('robust', 'minmax', or 'standard'), by default 'robust'
+    include_extremes_analysis : bool, optional
+        Whether to perform analysis of extreme values, by default True
+    temp_stats_path : str, optional
+        Path to pre-computed temperature statistics, by default None
+        
+    Returns
+    -------
+    Tuple[pd.DataFrame, Any, Dict[str, Any]]
+        Scaled DataFrame, scaler, and metadata with extremes analysis
+    """
+    logger.info(f"Performing enhanced preprocessing with {scaling_method} scaling")
+    
+    # Make a copy of input data
+    df_copy = df.copy()
+    
+    # Analyze temperature distribution
+    extremes_info = {}
+    
+    # Try to load pre-computed temperature statistics if path is provided
+    loaded_temp_stats = None
+    if temp_stats_path and os.path.exists(temp_stats_path):
+        try:
+            with open(temp_stats_path, 'r') as f:
+                loaded_temp_stats = json.load(f)
+            logger.info(f"Loaded temperature statistics from {temp_stats_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load temperature statistics: {str(e)}")
+    
+    if include_extremes_analysis and target_column in df_copy.columns:
+        # Use pre-computed statistics or calculate now
+        if loaded_temp_stats:
+            temp_stats = loaded_temp_stats
+            logger.info("Using pre-computed temperature statistics")
+        else:
+            # Run the analysis function
+            temp_stats = analyze_temperature_distribution(df_copy, target_column)
+            logger.info("Computed temperature statistics")
+        
+        extremes_info['temperature_stats'] = temp_stats
+        extremes_info['extreme_threshold'] = temp_stats['p95']
+        extremes_info['extreme_count'] = int((df_copy[target_column] >= temp_stats['p95']).sum())
+        extremes_info['extreme_percentage'] = float((df_copy[target_column] >= temp_stats['p95']).mean() * 100)
+        
+        logger.info(f"Dataset contains {extremes_info['extreme_count']} extreme temperature values "
+                   f"(≥ {extremes_info['extreme_threshold']:.2f}°C), "
+                   f"which is {extremes_info['extreme_percentage']:.2f}% of the data")
+    
+    # Choose and apply the appropriate scaler
+    if scaling_method == 'robust':
+        # RobustScaler is better for data with outliers
+        scaler = RobustScaler()
+        logger.info("Using RobustScaler which is more appropriate for data with outliers")
+    elif scaling_method == 'minmax':
+        # MinMaxScaler with wider range to better preserve differences in extreme values
+        scaler = MinMaxScaler(feature_range=(-1, 1))
+        logger.info("Using MinMaxScaler with range (-1, 1) to better preserve extreme values")
+    else:
+        # Standard scaler
+        scaler = StandardScaler()
+        logger.info("Using StandardScaler")
+    
+    # Fit and transform the data
+    scaled_data = pd.DataFrame(
+        scaler.fit_transform(df_copy),
+        index=df_copy.index,
+        columns=df_copy.columns
+    )
+    
+    logger.info(f"Scaling complete, data shape: {scaled_data.shape}")
+    
+    # Create metadata dictionary
+    metadata = {
+        'scaling_method': scaling_method,
+        'extremes_info': extremes_info,
+        'feature_names': list(df_copy.columns),
+        'scaler_type': type(scaler).__name__
+    }
+    
+    return scaled_data, scaler, metadata
+
+def clean_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean dataset by handling infinity, NaN values, and extreme outliers.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input DataFrame
+        
+    Returns
+    -------
+    pd.DataFrame
+        Cleaned DataFrame
+    """
+    logger.info("Cleaning dataset to remove infinities and extreme values")
+    
+    # Make a copy to avoid modifying the original
+    cleaned_df = df.copy()
+    
+    # Count initial issues
+    initial_inf_count = np.isinf(cleaned_df.values).sum()
+    initial_nan_count = np.isnan(cleaned_df.values).sum()
+    
+    logger.info(f"Initial data state: {initial_inf_count} infinities, {initial_nan_count} NaNs")
+    
+    # Replace infinity values with NaN
+    cleaned_df = cleaned_df.replace([np.inf, -np.inf], np.nan)
+    
+    # For each column, replace NaNs with column median and cap extreme values
+    for column in cleaned_df.columns:
+        # Skip columns that are all NaN
+        if cleaned_df[column].isna().all():
+            logger.warning(f"Column '{column}' contains all NaNs and will be dropped")
+            continue
+            
+        # Get column statistics (ignoring NaNs)
+        col_median = cleaned_df[column].median()
+        col_std = cleaned_df[column].std()
+        
+        # If std is NaN or 0, use a small default value
+        if np.isnan(col_std) or col_std == 0:
+            col_std = 1e-5
+            
+        # Define acceptable range (10 std from median)
+        lower_bound = col_median - 10 * col_std
+        upper_bound = col_median + 10 * col_std
+        
+        # Replace NaNs with median - FIXED: assigning back to DataFrame
+        cleaned_df[column] = cleaned_df[column].fillna(col_median)
+        
+        # Cap extreme values - FIXED: more direct approach
+        cleaned_df.loc[cleaned_df[column] < lower_bound, column] = lower_bound
+        cleaned_df.loc[cleaned_df[column] > upper_bound, column] = upper_bound
+    
+    # Verify no infinities or NaNs remain
+    final_inf_count = np.isinf(cleaned_df.values).sum()
+    final_nan_count = np.isnan(cleaned_df.values).sum()
+    
+    if final_inf_count > 0 or final_nan_count > 0:
+        logger.warning(f"After cleaning: {final_inf_count} infinities, {final_nan_count} NaNs remain")
+        
+        # Last resort - drop problematic columns
+        for column in cleaned_df.columns:
+            if np.isinf(cleaned_df[column]).any() or np.isnan(cleaned_df[column]).any():
+                logger.warning(f"Dropping problematic column: '{column}'")
+                cleaned_df = cleaned_df.drop(columns=[column])
+    
+    # Final verification
+    assert not np.isinf(cleaned_df.values).any(), "Infinity values still present after cleaning"
+    assert not np.isnan(cleaned_df.values).any(), "NaN values still present after cleaning"
+    
+    logger.info(f"Cleaning complete: {cleaned_df.shape[1]} columns remaining")
+    return cleaned_df
 
 def create_sequences(
     df: pd.DataFrame,
@@ -155,6 +331,466 @@ def create_sequences(
                 feature_columns)
     
     return np.array(X_sequences), np.array(y_sequences), feature_columns
+
+def create_encoder_decoder_model(
+    input_shape: Tuple[int, int],
+    output_dim: int,
+    encoder_units: List[int] = [128, 128],
+    decoder_units: List[int] = [128, 64],
+    dropout_rate: float = 0.3,
+    recurrent_dropout: float = 0.2,
+    use_attention: bool = True
+) -> tf.keras.Model:
+    """
+    Create an encoder-decoder architecture with optional attention mechanism.
+    
+    Parameters
+    ----------
+    input_shape : Tuple[int, int]
+        Shape of input sequences (sequence_length, n_features)
+    output_dim : int
+        Number of steps to forecast
+    encoder_units : List[int], optional
+        Units in each encoder LSTM layer, by default [128, 128]
+    decoder_units : List[int], optional
+        Units in each decoder LSTM layer, by default [128, 64]
+    dropout_rate : float, optional
+        Dropout rate after layers, by default 0.3
+    recurrent_dropout : float, optional
+        Recurrent dropout within LSTM cells, by default 0.2
+    use_attention : bool, optional
+        Whether to use attention mechanism, by default True
+        
+    Returns
+    -------
+    tf.keras.Model
+        Compiled encoder-decoder model
+    """
+    logger.info(f"Creating encoder-decoder model with{'out' if not use_attention else ''} attention")
+    
+    # Encoder
+    encoder_inputs = Input(shape=input_shape, name='encoder_inputs')
+    encoder = encoder_inputs
+    encoder_states = []
+    
+    for i, units in enumerate(encoder_units):
+        return_sequences = i < len(encoder_units) - 1 or use_attention
+        
+        lstm_layer = Bidirectional(
+            LSTM(
+                units,
+                return_sequences=return_sequences,
+                return_state=True,
+                recurrent_dropout=recurrent_dropout,
+                name=f'encoder_lstm_{i}'
+            )
+        )
+        
+        if i == 0:
+            encoder, forward_h, forward_c, backward_h, backward_c = lstm_layer(encoder)
+        else:
+            encoder, forward_h, forward_c, backward_h, backward_c = lstm_layer(encoder)
+        
+        # Concatenate forward and backward states
+        state_h = Concatenate()([forward_h, backward_h])
+        state_c = Concatenate()([forward_c, backward_c])
+        encoder_states = [state_h, state_c]
+    
+    # Attention mechanism
+    if use_attention:
+        # Create decoder input (will be used later for teacher forcing)
+        decoder_inputs = Input(shape=(None, 1), name='decoder_inputs')
+        
+        # Initialize decoder with encoder states
+        decoder = decoder_inputs
+        
+        # Build decoder LSTM
+        decoder_lstm = LSTM(
+            decoder_units[0],
+            return_sequences=True,
+            return_state=True,
+            recurrent_dropout=recurrent_dropout,
+            name='decoder_lstm'
+        )
+        
+        # Initial decoder state is the encoder final state
+        decoder_outputs, _, _ = decoder_lstm(decoder, initial_state=encoder_states)
+        
+        # Apply attention
+        attention_layer = Attention(name='attention_layer')
+        context_vector = attention_layer([decoder_outputs, encoder])
+        
+        # Concatenate context vector and decoder output
+        decoder_combined = Concatenate(axis=-1)([decoder_outputs, context_vector])
+        
+        # Apply dropout
+        decoder_combined = Dropout(dropout_rate)(decoder_combined)
+        
+        # Add dense layers
+        for i, units in enumerate(decoder_units[1:]):
+            decoder_combined = Dense(
+                units,
+                activation='relu',
+                name=f'decoder_dense_{i}'
+            )(decoder_combined)
+            decoder_combined = Dropout(dropout_rate)(decoder_combined)
+        
+        # Output layer
+        outputs = Dense(1, name='output_layer')(decoder_combined)
+        
+        # Define training model (with teacher forcing)
+        train_model = Model([encoder_inputs, decoder_inputs], outputs)
+        
+        # Define inference encoder model
+        encoder_model = Model(encoder_inputs, [encoder] + encoder_states)
+        
+        # Define inference decoder model
+        decoder_state_input_h = Input(shape=(decoder_units[0]*2,))
+        decoder_state_input_c = Input(shape=(decoder_units[0]*2,))
+        decoder_states_inputs = [decoder_state_input_h, decoder_state_input_c]
+        
+        decoder_outputs, state_h, state_c = decoder_lstm(
+            decoder_inputs, initial_state=decoder_states_inputs
+        )
+        decoder_states = [state_h, state_c]
+        
+        decoder_outputs = attention_layer([decoder_outputs, encoder])
+        decoder_outputs = Concatenate(axis=-1)([decoder_outputs, decoder_outputs])
+        decoder_outputs = Dropout(dropout_rate)(decoder_outputs)
+        
+        for i, units in enumerate(decoder_units[1:]):
+            decoder_outputs = Dense(
+                units,
+                activation='relu',
+                name=f'decoder_dense_{i}_inference'
+            )(decoder_outputs)
+            decoder_outputs = Dropout(dropout_rate)(decoder_outputs)
+        
+        decoder_outputs = Dense(1, name='output_layer_inference')(decoder_outputs)
+        
+        decoder_model = Model(
+            [decoder_inputs, encoder] + decoder_states_inputs,
+            [decoder_outputs] + decoder_states
+        )
+        
+        # Compile model
+        train_model.compile(
+            optimizer=Adam(learning_rate=0.001),
+            loss='mse',
+            metrics=['mae']
+        )
+        
+        return train_model, encoder_model, decoder_model
+    
+    else:
+        # Simpler model without attention mechanism
+        decoder = encoder if len(encoder_units) == len(decoder_units) else None
+        
+        for i, units in enumerate(decoder_units):
+            return_sequences = True  # We want sequences for all decoder layers
+            
+            if decoder is None:
+                # First decoder layer, initialize with encoder states
+                decoder_lstm = LSTM(
+                    units,
+                    return_sequences=return_sequences,
+                    recurrent_dropout=recurrent_dropout,
+                    name=f'decoder_lstm_{i}'
+                )
+                decoder = decoder_lstm(encoder_states[0], initial_state=encoder_states)
+            else:
+                decoder_lstm = LSTM(
+                    units,
+                    return_sequences=return_sequences,
+                    recurrent_dropout=recurrent_dropout,
+                    name=f'decoder_lstm_{i}'
+                )
+                decoder = decoder_lstm(decoder)
+            
+            decoder = Dropout(dropout_rate)(decoder)
+        
+        # Flatten for output layer
+        decoder = Flatten()(decoder)
+        
+        # Add dense layers to map to output dimension
+        decoder = Dense(128, activation='relu')(decoder)
+        decoder = Dropout(dropout_rate)(decoder)
+        
+        outputs = Dense(output_dim)(decoder)
+        
+        model = Model(encoder_inputs, outputs)
+        
+        # Compile model
+        model.compile(
+            optimizer=Adam(learning_rate=0.001),
+            loss='mse',
+            metrics=['mae']
+        )
+        
+        return model
+    
+class ExtremeValueLoss(tf.keras.losses.Loss):
+    """
+    Custom loss function that gives higher weight to errors on extreme values.
+    
+    Parameters
+    ----------
+    threshold : float
+        Temperature threshold above which to apply higher weight
+    high_temp_weight : float
+        Weight multiplier for temperatures above threshold
+    reduction : str
+        Reduction method ('auto', 'none', 'sum', 'mean')
+    name : str
+        Name of the loss function
+    """
+    
+    def __init__(
+        self,
+        threshold: float = 40.0,
+        high_temp_weight: float = 2.0,
+        reduction: str = 'auto',
+        name: str = 'extreme_value_loss'
+    ):
+        super().__init__(reduction=reduction, name=name)
+        self.threshold = threshold
+        self.high_temp_weight = high_temp_weight
+    
+    def call(self, y_true, y_pred):
+        # Calculate MSE
+        mse = tf.square(y_true - y_pred)
+        
+        # Create mask for extreme values
+        extreme_mask = tf.cast(y_true > self.threshold, tf.float32)
+        
+        # Apply higher weight to errors on extreme values
+        weighted_mse = mse * (1 + extreme_mask * (self.high_temp_weight - 1))
+        
+        return weighted_mse
+    
+def train_with_horizon_weighting(
+    model: tf.keras.Model,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    batch_size: int = 32,
+    epochs: int = 100,
+    patience: int = 15,
+    min_delta: float = 0.0001,
+    horizon_weights: Optional[np.ndarray] = None,
+    model_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Train model with custom horizon weighting to prioritize earlier predictions.
+    
+    Parameters
+    ----------
+    model : tf.keras.Model
+        Model to train
+    X_train, y_train : np.ndarray
+        Training data
+    X_val, y_val : np.ndarray
+        Validation data
+    batch_size, epochs, patience, min_delta : standard training parameters
+    horizon_weights : np.ndarray, optional
+        Weights for each forecast horizon (higher for more important horizons)
+    model_path : str, optional
+        Path to save best model
+        
+    Returns
+    -------
+    Dict[str, Any]
+        Training history and information
+    """
+    logger.info(f"Training model with horizon weighting")
+    
+    # Handle case where model is a tuple (train_model, encoder_model, decoder_model)
+    if isinstance(model, tuple):
+        train_model = model[0]  # Extract just the training model
+    else:
+        train_model = model
+    
+    # Create horizon weights if not provided
+    if horizon_weights is None:
+        # Give higher weights to earlier horizons (exponential decay)
+        forecast_horizon = y_train.shape[1]
+        horizon_weights = np.exp(-0.1 * np.arange(forecast_horizon))
+        horizon_weights = horizon_weights / np.sum(horizon_weights)
+        logger.info(f"Using exponential decay for horizon weights")
+    
+    # Create callbacks
+    callbacks = []
+    
+    # Early stopping
+    early_stopping = tf.keras.callbacks.EarlyStopping(
+        monitor='val_loss',
+        patience=patience,
+        min_delta=min_delta,
+        verbose=1,
+        restore_best_weights=True
+    )
+    callbacks.append(early_stopping)
+    
+    # Learning rate reduction
+    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=patience // 2,
+        min_lr=1e-6,
+        verbose=1
+    )
+    callbacks.append(reduce_lr)
+    
+    # Model checkpoint
+    if model_path:
+        model_checkpoint = tf.keras.callbacks.ModelCheckpoint(
+            model_path,
+            monitor='val_loss',
+            save_best_only=True,
+            verbose=1
+        )
+        callbacks.append(model_checkpoint)
+    
+    # Train with custom generator (if using sample_weight_mode='temporal')
+    # Note: This requires modification to the model.fit call
+    # For simplicity, we'll use a custom loss wrapper approach instead
+    
+    class HorizonWeightedLoss(tf.keras.losses.Loss):
+        def __init__(self, base_loss, horizon_weights):
+            super().__init__(name='horizon_weighted_loss')
+            self.base_loss = base_loss
+            self.horizon_weights = tf.constant(horizon_weights, dtype=tf.float32)
+        
+        def call(self, y_true, y_pred):
+            # Calculate base loss for each sample and horizon
+            # Shape: (batch_size, horizon)
+            per_horizon_loss = tf.square(y_true - y_pred)
+            
+            # Apply horizon weights
+            weighted_loss = per_horizon_loss * self.horizon_weights
+            
+            # Sum across horizons, mean across batch
+            return tf.reduce_mean(tf.reduce_sum(weighted_loss, axis=1))
+    
+    # Store original loss
+    original_loss = train_model.loss
+    
+    # Create horizon-weighted wrapper
+    weighted_loss = HorizonWeightedLoss(original_loss, horizon_weights)
+    
+    # Set model loss (temporarily)
+    train_model.compile(
+        optimizer=train_model.optimizer,
+        loss=weighted_loss,
+        metrics=train_model.metrics
+    )
+    
+    # Train the model
+    history = train_model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=callbacks,
+        verbose=1
+    )
+    
+    # Restore original loss
+    train_model.compile(
+        optimizer=train_model.optimizer,
+        loss=original_loss,
+        metrics=train_model.metrics
+    )
+    
+    # Get training information
+    epochs_completed = len(history.history['loss'])
+    best_epoch = np.argmin(history.history['val_loss']) + 1
+    best_val_loss = min(history.history['val_loss'])
+    best_val_mae = min(history.history['val_mae'])
+    
+    logger.info(f"Training completed after {epochs_completed} epochs")
+    logger.info(f"Best epoch: {best_epoch}, val_loss: {best_val_loss:.4f}, val_mae: {best_val_mae:.4f}")
+    
+    # Return history and additional information
+    return {
+        'history': history.history,
+        'epochs_completed': epochs_completed,
+        'best_epoch': best_epoch,
+        'best_val_loss': best_val_loss,
+        'best_val_mae': best_val_mae,
+        'horizon_weights': horizon_weights.tolist()
+    }
+
+def create_balanced_sequences(
+    df: pd.DataFrame,
+    target_column: str,
+    sequence_length: int,
+    forecast_horizon: int,
+    feature_columns: Optional[List[str]] = None,
+    extreme_threshold: Optional[float] = None,
+    extreme_sample_weight: float = 2.0,
+    step: int = 1
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
+    """
+    Create sequences with balanced representation of extreme values.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with features and target
+    target_column : str
+        Name of the target column to forecast
+    sequence_length : int
+        Number of past time steps to use as input sequence
+    forecast_horizon : int
+        Number of future time steps to predict
+    feature_columns : List[str], optional
+        List of feature columns to include, by default None (uses all columns except target)
+    extreme_threshold : float, optional
+        Threshold for defining extreme values, by default None (uses 95th percentile)
+    extreme_sample_weight : float, optional
+        Weight for extreme samples, by default 2.0
+    step : int, optional
+        Step size between consecutive sequences, by default 1
+        
+    Returns
+    -------
+    Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]
+        X sequences, y sequences, sample weights, and list of feature names
+    """
+    logger.info(f"Creating balanced sequences with length {sequence_length}, horizon {forecast_horizon}")
+    
+    # First create regular sequences
+    X, y, features = create_sequences(
+        df, target_column, sequence_length, forecast_horizon, 
+        step=step, feature_columns=feature_columns
+    )
+    
+    # If no extreme threshold provided, use 95th percentile
+    if extreme_threshold is None:
+        if target_column in df.columns:
+            extreme_threshold = df[target_column].quantile(0.95)
+            logger.info(f"Using 95th percentile ({extreme_threshold:.2f}) as extreme threshold")
+        else:
+            logger.warning(f"Target column '{target_column}' not found, cannot determine extreme threshold")
+            extreme_threshold = float('inf')  # Default that won't match anything
+    
+    # Calculate weights for each sequence
+    weights = np.ones(len(y))
+    
+    # Check for extreme values in target sequences
+    for i in range(len(y)):
+        # If any value in the target sequence is extreme, give it higher weight
+        if np.any(y[i] >= extreme_threshold):
+            weights[i] = extreme_sample_weight
+    
+    # Count extreme sequences
+    extreme_count = np.sum(weights > 1.0)
+    logger.info(f"Created {len(X)} sequences, including {extreme_count} with extreme values "
+               f"({extreme_count/len(X)*100:.2f}%)")
+    
+    return X, y, weights, features
 
 def split_train_val(
     X: np.ndarray,
@@ -628,12 +1264,13 @@ if __name__ == "__main__":
     print(f"Project directory: {project_dir}")
     
     # Define paths
-    features_path = project_dir / "Data" / "features" / "train_features.csv"
+    features_path = project_dir / "data" / "features" / "train_features_enhanced.csv"
+    temp_stats_path = project_dir / "data" / "preprocessed" / "temperature_stats.json"
     model_dir = project_dir / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
     
-    model_path = model_dir / "lstm_model.keras"
-    scaler_path = model_dir / "scaler.pkl"
+    model_path = model_dir / "lstm_encoder_decoder_model.keras"
+    scaler_path = model_dir / "robust_scaler.pkl"
     history_plot_path = model_dir / "report" / "training_history.png"
     
     # Load feature-engineered data
@@ -645,17 +1282,38 @@ if __name__ == "__main__":
     sequence_length = 24  # Use 24 hours of past data
     forecast_horizon = 24  # Predict next 24 hours
     
-    # Exclude some features if needed
-    excluded_features = []
-    feature_columns = [col for col in df.columns if col != target_column and col not in excluded_features]
+    # Get extreme temperature threshold
+    extreme_threshold = None
+    if os.path.exists(temp_stats_path):
+        try:
+            with open(temp_stats_path, 'r') as f:
+                temp_stats = json.load(f)
+                extreme_threshold = temp_stats.get('p95', 45.0)
+                print(f"Using extreme temperature threshold: {extreme_threshold}°C")
+        except:
+            extreme_threshold = 45.0
+    else:
+        extreme_threshold = df[target_column].quantile(0.95)
+        print(f"Calculated extreme temperature threshold: {extreme_threshold}°C")
     
-    # Normalize data
-    scaler = MinMaxScaler(feature_range=(0, 1))
+    # Clean the dataset to remove infinities and extreme values
+    df = clean_dataset(df)
+    
+    # Preprocessing with enhanced scaling
+    from sklearn.preprocessing import RobustScaler
+    scaler = RobustScaler()
+    
+    # Scale all columns 
     df_scaled = pd.DataFrame(
         scaler.fit_transform(df),
-        index=df.index,
+        index=df.index, 
         columns=df.columns
     )
+    
+    # Exclude some features with low importance or high correlation
+    # Note: Adjust this list based on feature importance analysis
+    excluded_features = []
+    feature_columns = [col for col in df.columns if col != target_column and col not in excluded_features]
     
     # Create sequences
     X, y, features_used = create_sequences(
@@ -669,38 +1327,45 @@ if __name__ == "__main__":
     # Split into train and validation sets
     X_train, X_val, y_train, y_val = split_train_val(X, y, val_size=0.2)
     
-    # Create model
-    model = create_lstm_model(
+    # Create encoder-decoder model
+    model_result = create_encoder_decoder_model(
         input_shape=(X.shape[1], X.shape[2]),
         output_dim=forecast_horizon,
-        lstm_units=[128, 64],
-        dropout_rate=0.2,
-        learning_rate=0.001,
-        bidirectional=True
+        encoder_units=[128, 128],
+        decoder_units=[128, 96, 64],
+        dropout_rate=0.3,
+        recurrent_dropout=0.2,
+        use_attention=True
     )
     
-    # Train model
-    training_info = train_model(
-        model=model,
+    # Create horizon weights (higher weights for earlier horizons and extreme temps)
+    horizon_weights = np.exp(-0.07 * np.arange(forecast_horizon))
+    horizon_weights = horizon_weights / np.sum(horizon_weights)
+    
+    # Train with horizon weighting to prioritize earlier predictions
+    training_info = train_with_horizon_weighting(
+        model=model_result,  # Pass the entire result (function will handle tuple)
         X_train=X_train,
         y_train=y_train,
         X_val=X_val,
         y_val=y_val,
         batch_size=32,
-        epochs=100,
-        patience=10,
+        epochs=150,
+        patience=20,
+        min_delta=0.0001,
+        horizon_weights=horizon_weights,
         model_path=str(model_path)
     )
     
-    # Plot training history
-    plot_training_history(
-        history=training_info['history'],
-        output_path=str(history_plot_path)
-    )
+    # Extract the training model if model_result is a tuple
+    if isinstance(model_result, tuple):
+        train_model = model_result[0]
+    else:
+        train_model = model_result
     
-    # Save model and associated artifacts
+    # Save model and artifacts
     save_model(
-        model=model,
+        model=train_model,  # Use the training model
         training_info=training_info,
         model_path=str(model_path),
         scaler_path=str(scaler_path),
@@ -709,8 +1374,8 @@ if __name__ == "__main__":
         metadata={
             'sequence_length': sequence_length,
             'forecast_horizon': forecast_horizon,
-            'target_column': target_column
+            'target_column': target_column,
+            'extreme_threshold': extreme_threshold,
+            'model_type': 'encoder_decoder_with_attention'
         }
     )
-    
-    print("Model training and saving completed")

@@ -22,10 +22,440 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict, Tuple, Optional, Union
 from datetime import datetime
+import json
 
 # Configure logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+def create_temperature_rate_features(
+    df: pd.DataFrame,
+    temperature_column: str = 'OT',
+    windows: List[int] = [1, 2, 3, 6, 12, 24, 48]
+) -> pd.DataFrame:
+    """
+    Create features that capture the rate of change in temperature.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with datetime index
+    temperature_column : str, optional
+        Name of temperature column, by default 'OT'
+    windows : List[int], optional
+        Windows for calculating rate of change, by default [1, 2, 3, 6, 12, 24, 48]
+        
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with additional rate of change features
+    """
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("DataFrame must have a DatetimeIndex")
+    
+    logger.info(f"Creating temperature rate of change features for {temperature_column}")
+    
+    df_with_rates = df.copy()
+    
+    if temperature_column not in df.columns:
+        logger.warning(f"Temperature column '{temperature_column}' not found in DataFrame")
+        return df_with_rates
+    
+    # Create rate of change features for different time windows
+    for window in windows:
+        # Simple difference (change per time step)
+        df_with_rates[f'{temperature_column}_diff_{window}'] = df[temperature_column].diff(window)
+        
+        # Rate of change (change per unit time)
+        df_with_rates[f'{temperature_column}_roc_{window}'] = df[temperature_column].diff(window) / window
+        
+        # Percentage change
+        df_with_rates[f'{temperature_column}_pct_{window}'] = df[temperature_column].pct_change(window) * 100
+        
+        logger.debug(f"Created rate features with window {window}")
+    
+    # Create acceleration features (rate of change of the rate of change)
+    for window in windows[:-1]:  # Use smaller windows for acceleration
+        df_with_rates[f'{temperature_column}_accel_{window}'] = df_with_rates[f'{temperature_column}_roc_{window}'].diff(window)
+    
+    logger.info(f"Created {len(windows) * 3 + len(windows) - 1} temperature rate features")
+    return df_with_rates
+
+def create_extreme_temperature_features(
+    df: pd.DataFrame,
+    temperature_column: str = 'OT',
+    threshold_quantile: float = 0.9,
+    windows: List[int] = [24, 48, 72, 168]  # 1, 2, 3, 7 days
+) -> pd.DataFrame:
+    """
+    Create features specifically designed to help predict extreme temperatures.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with datetime index
+    temperature_column : str, optional
+        Name of temperature column, by default 'OT'
+    threshold_quantile : float, optional
+        Quantile threshold for extreme temperature, by default 0.9
+    windows : List[int], optional
+        Windows for calculating features, by default [24, 48, 72, 168]
+        
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with additional extreme temperature features
+    """
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("DataFrame must have a DatetimeIndex")
+    
+    logger.info("Creating extreme temperature features")
+    
+    # Instead of modifying DataFrame directly, collect all new features in a dictionary
+    new_features = {}
+    
+    if temperature_column not in df.columns:
+        logger.warning(f"Temperature column '{temperature_column}' not found in DataFrame")
+        return df.copy()
+    
+    # Calculate extreme temperature threshold
+    threshold = df[temperature_column].quantile(threshold_quantile)
+    logger.info(f"Extreme temperature threshold ({threshold_quantile} quantile): {threshold:.2f}")
+    
+    # Create binary indicator for extreme temperatures
+    new_features[f'{temperature_column}_extreme'] = (df[temperature_column] >= threshold).astype(int)
+    
+    # Track time since last extreme temperature
+    extreme_events = df.index[df[temperature_column] >= threshold]
+    
+    if len(extreme_events) > 0:
+        # Initialize with large value
+        hours_since_extreme = np.full(len(df), len(df))  # Initialize with large value
+        
+        # For each time point, calculate hours since most recent extreme event
+        for i, current_time in enumerate(df.index):
+            # Find the most recent extreme event before current time
+            past_extremes = extreme_events[extreme_events < current_time]
+            
+            if len(past_extremes) > 0:
+                most_recent = past_extremes[-1]
+                hours_diff = (current_time - most_recent).total_seconds() / 3600
+                hours_since_extreme[i] = hours_diff
+        
+        new_features['hours_since_extreme'] = hours_since_extreme
+    
+    # Calculate moving max and range features
+    for window in windows:
+        # Maximum temperature in past window
+        new_features[f'{temperature_column}_max_{window}'] = df[temperature_column].rolling(window=window, min_periods=1).max()
+        
+        # Temperature range in past window
+        new_features[f'{temperature_column}_range_{window}'] = (
+            df[temperature_column].rolling(window=window, min_periods=1).max() - 
+            df[temperature_column].rolling(window=window, min_periods=1).min()
+        )
+        
+        # Count of extreme events in past window
+        extreme_indicator = (df[temperature_column] >= threshold).astype(int)
+        new_features[f'extreme_count_{window}'] = extreme_indicator.rolling(window=window, min_periods=1).sum()
+    
+    # Exponentially weighted features
+    for span in [12, 24, 48]:
+        # EWM on temperature
+        ewm_mean = df[temperature_column].ewm(span=span).mean()
+        new_features[f'{temperature_column}_ewm_{span}'] = ewm_mean
+        
+        # EWM on temperature difference from EWM
+        new_features[f'{temperature_column}_ewm_diff_{span}'] = df[temperature_column] - ewm_mean
+    
+    # Create a DataFrame with all new features
+    new_features_df = pd.DataFrame(new_features, index=df.index)
+    
+    # Concatenate with original DataFrame
+    df_with_extremes = pd.concat([df.copy(), new_features_df], axis=1)
+    
+    logger.info(f"Created extreme temperature features")
+    return df_with_extremes
+
+def create_trend_reversal_features(
+    df: pd.DataFrame,
+    columns: List[str],
+    windows: List[int] = [6, 12, 24, 48]
+) -> pd.DataFrame:
+    """
+    Create features that help predict trend reversals in time series.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with datetime index
+    columns : List[str]
+        Columns to create trend reversal features for
+    windows : List[int], optional
+        Windows for calculating trend features, by default [6, 12, 24, 48]
+        
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with additional trend reversal features
+    """
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("DataFrame must have a DatetimeIndex")
+    
+    logger.info(f"Creating trend reversal features for {len(columns)} columns")
+    
+    # Instead of modifying the dataframe directly, collect all new features
+    # and concatenate them at the end
+    new_features = {}
+    
+    for col in columns:
+        if col not in df.columns:
+            logger.warning(f"Column '{col}' not found in DataFrame, skipping")
+            continue
+        
+        for window in windows:
+            # Calculate rolling mean
+            rolling_mean = df[col].rolling(window=window, min_periods=1).mean()
+            
+            # Trend direction (1 for up, -1 for down, 0 for flat)
+            trend_dir_name = f'{col}_trend_dir_{window}'
+            new_features[trend_dir_name] = np.sign(rolling_mean.diff())
+            
+            # Trend strength (difference from longer-term mean)
+            long_window = window * 2
+            long_mean = df[col].rolling(window=long_window, min_periods=1).mean()
+            new_features[f'{col}_trend_str_{window}'] = rolling_mean - long_mean
+            
+            # Trend duration (how long current trend has persisted)
+            trend_changes = np.sign(rolling_mean.diff()).diff().fillna(0) != 0
+            trend_change_points = np.where(trend_changes)[0]
+            
+            # Initialize trend duration array
+            trend_duration = np.zeros(len(df))
+            
+            # Calculate duration for each point
+            for i in range(len(df)):
+                # Find most recent change point before current position
+                prev_changes = trend_change_points[trend_change_points < i]
+                
+                if len(prev_changes) > 0:
+                    most_recent = prev_changes[-1]
+                    trend_duration[i] = i - most_recent
+                else:
+                    trend_duration[i] = i  # No previous change point
+            
+            new_features[f'{col}_trend_dur_{window}'] = trend_duration
+            
+            # Calculate direction changes separately using the new feature we just created
+            # Instead of trying to access it from the original DataFrame
+            trend_dir_values = new_features[trend_dir_name]
+            
+            # For the rolling calculation on our new column, use pandas Series directly
+            direction_changes = pd.Series(trend_dir_values).rolling(window=window).apply(
+                lambda x: ((x[:-1] * x[1:]) < 0).sum() if len(x) > 1 else 0, 
+                raw=True
+            )
+            new_features[f'{col}_oscillation_{window}'] = direction_changes.values
+            
+            logger.debug(f"Created trend features for '{col}' with window {window}")
+    
+    # Create a DataFrame with all new features
+    new_features_df = pd.DataFrame(new_features, index=df.index)
+    
+    # Concatenate with the original DataFrame
+    df_with_trends = pd.concat([df.copy(), new_features_df], axis=1)
+    
+    logger.info(f"Created trend reversal features")
+    return df_with_trends
+
+def create_enhanced_load_features(
+    df: pd.DataFrame,
+    useful_load_columns: List[str] = ['HUFL', 'MUFL', 'LUFL'],
+    useless_load_columns: List[str] = ['HULL', 'MULL', 'LULL'],
+    windows: List[int] = [4, 12, 24, 48]
+) -> pd.DataFrame:
+    """
+    Create enhanced features from load columns with focus on relationship to temperature.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with datetime index
+    useful_load_columns : List[str], optional
+        Columns representing useful loads, by default ['HUFL', 'MUFL', 'LUFL']
+    useless_load_columns : List[str], optional
+        Columns representing useless loads, by default ['HULL', 'MULL', 'LULL']
+    windows : List[int], optional
+        Windows for calculating features, by default [4, 12, 24, 48]
+        
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with additional enhanced load features
+    """
+    logger.info("Creating enhanced load features")
+    
+    df_with_loads = df.copy()
+    
+    # Check if required columns exist
+    missing_useful = [col for col in useful_load_columns if col not in df.columns]
+    missing_useless = [col for col in useless_load_columns if col not in df.columns]
+    
+    if missing_useful or missing_useless:
+        missing = missing_useful + missing_useless
+        logger.warning(f"Some load columns are missing: {missing}")
+        
+        # Filter to only include available columns
+        useful_load_columns = [col for col in useful_load_columns if col in df.columns]
+        useless_load_columns = [col for col in useless_load_columns if col in df.columns]
+    
+    # If we have both useful and useless loads
+    if useful_load_columns and useless_load_columns:
+        # Create total loads
+        if len(useful_load_columns) > 0:
+            df_with_loads['total_useful_load'] = df[useful_load_columns].sum(axis=1)
+        
+        if len(useless_load_columns) > 0:
+            df_with_loads['total_useless_load'] = df[useless_load_columns].sum(axis=1)
+        
+        # Total load and ratio if both are available
+        if 'total_useful_load' in df_with_loads.columns and 'total_useless_load' in df_with_loads.columns:
+            df_with_loads['total_load'] = df_with_loads['total_useful_load'] + df_with_loads['total_useless_load']
+            
+            # Avoid division by zero
+            mask = df_with_loads['total_useless_load'] != 0
+            df_with_loads['load_efficiency'] = np.nan
+            df_with_loads.loc[mask, 'load_efficiency'] = (
+                df_with_loads.loc[mask, 'total_useful_load'] / df_with_loads.loc[mask, 'total_useless_load']
+            )
+            
+            # Replace infinities and NaNs with a high value
+            df_with_loads['load_efficiency'] = df_with_loads['load_efficiency'].replace([np.inf, -np.inf], np.nan)
+            df_with_loads['load_efficiency'] = df_with_loads['load_efficiency'].fillna(
+                df_with_loads['load_efficiency'].max() if df_with_loads['load_efficiency'].max() > 0 else 100
+            )
+    
+    # Create load volatility features
+    all_load_columns = useful_load_columns + useless_load_columns
+    
+    for col in all_load_columns:
+        for window in windows:
+            # Load volatility (standard deviation over window)
+            df_with_loads[f'{col}_volatility_{window}'] = df[col].rolling(window=window, min_periods=1).std()
+            
+            # Load momentum (rate of change)
+            df_with_loads[f'{col}_momentum_{window}'] = df[col].diff(window) / window
+    
+    # Create cross-correlations between loads if we have both OT and load columns
+    if 'OT' in df.columns:
+        for col in all_load_columns:
+            for window in windows:
+                # Calculate rolling correlation with temperature
+                df_with_loads[f'{col}_temp_corr_{window}'] = (
+                    df[['OT', col]].rolling(window=window, min_periods=window//2)
+                    .corr().unstack()[col]['OT']  # Extract correlation between col and OT
+                )
+    
+    # Create load pattern features (variations in load throughout day)
+    if isinstance(df.index, pd.DatetimeIndex):
+        # Group by hour of day
+        hour_groups = df.groupby(df.index.hour)
+        
+        # Calculate average load for each hour
+        for col in all_load_columns:
+            hourly_means = hour_groups[col].mean()
+            
+            # Create features showing deviation from typical load for this hour
+            for hour in range(24):
+                if hour in hourly_means.index:
+                    typical_load = hourly_means[hour]
+                    
+                    # Create mask for this hour
+                    hour_mask = df.index.hour == hour
+                    
+                    # Add deviation from typical load for this hour
+                    col_name = f'{col}_dev_from_hour_{hour}'
+                    df_with_loads[col_name] = np.nan
+                    df_with_loads.loc[hour_mask, col_name] = df.loc[hour_mask, col] - typical_load
+    
+    logger.info(f"Created enhanced load features")
+    return df_with_loads
+
+def create_enhanced_fourier_features(
+    df: pd.DataFrame,
+    periods: Dict[str, int] = {'daily': 24, 'weekly': 168, 'yearly': 8760},
+    fourier_orders: Dict[str, int] = {'daily': 6, 'weekly': 4, 'yearly': 8}
+) -> pd.DataFrame:
+    """
+    Create enhanced Fourier features with higher orders for better seasonality capture.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with datetime index
+    periods : Dict[str, int], optional
+        Dictionary mapping period names to number of hours, by default
+        {'daily': 24, 'weekly': 168, 'yearly': 8760}
+    fourier_orders : Dict[str, int], optional
+        Dictionary mapping period names to Fourier order, by default
+        {'daily': 6, 'weekly': 4, 'yearly': 8}
+        
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with additional enhanced Fourier features
+    """
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("DataFrame must have a DatetimeIndex")
+    
+    logger.info("Creating enhanced Fourier features with higher orders")
+    
+    df_with_fourier = df.copy()
+    
+    # Create hour of year feature (0 to 8759)
+    start_of_year = pd.Timestamp(df.index[0].year, 1, 1)
+    hours_of_year = ((df.index - start_of_year).total_seconds() / 3600).astype(int) % 8760
+    
+    # Create hour of week feature (0 to 167)
+    hours_of_week = (df.index.dayofweek * 24 + df.index.hour) % 168
+    
+    # Create hour of day feature (0 to 23)
+    hours_of_day = df.index.hour
+    
+    # Create Fourier features for each period with higher orders
+    for period_name, period in periods.items():
+        order = fourier_orders[period_name]
+        
+        if period_name == 'daily':
+            hour_var = hours_of_day
+        elif period_name == 'weekly':
+            hour_var = hours_of_week
+        elif period_name == 'yearly':
+            hour_var = hours_of_year
+        else:
+            logger.warning(f"Unknown period: {period_name}, skipping")
+            continue
+        
+        for k in range(1, order + 1):
+            df_with_fourier[f'{period_name}_sin_{k}'] = np.sin(2 * k * np.pi * hour_var / period)
+            df_with_fourier[f'{period_name}_cos_{k}'] = np.cos(2 * k * np.pi * hour_var / period)
+    
+    # Add interaction features between Fourier components
+    # These help capture more complex seasonal patterns
+    for period1 in periods.keys():
+        for period2 in periods.keys():
+            if period1 != period2:
+                # Create interaction between first harmonic of each period
+                df_with_fourier[f'{period1}_sin_1_{period2}_sin_1'] = (
+                    df_with_fourier[f'{period1}_sin_1'] * df_with_fourier[f'{period2}_sin_1']
+                )
+                df_with_fourier[f'{period1}_cos_1_{period2}_cos_1'] = (
+                    df_with_fourier[f'{period1}_cos_1'] * df_with_fourier[f'{period2}_cos_1']
+                )
+    
+    total_features = sum([2 * fourier_orders[period] for period in periods]) + 4  # Basic + interactions
+    logger.info(f"Created {total_features} enhanced Fourier features")
+    return df_with_fourier
 
 def create_lag_features(
     df: pd.DataFrame,
@@ -330,13 +760,17 @@ def build_feature_set(
     include_load_ratio: bool = True,
     include_load_diff: bool = True,
     include_fourier: bool = True,
+    include_temperature_rates: bool = True,
+    include_extreme_temp: bool = True,
+    include_trend_reversal: bool = True,
+    include_enhanced_load: bool = True,
     lag_columns: Optional[List[str]] = None,
     lag_periods: Optional[List[int]] = None,
     rolling_columns: Optional[List[str]] = None,
     rolling_windows: Optional[List[int]] = None,
     fourier_periods: Optional[Dict[str, int]] = None,
     fourier_order: Optional[Dict[str, int]] = None,
-    max_gap_limit: int = 24  # New parameter for maximum gap size to fill
+    max_gap_limit: int = 24
 ) -> pd.DataFrame:
     """
     Build a comprehensive feature set by applying multiple feature engineering techniques.
@@ -355,6 +789,14 @@ def build_feature_set(
         Whether to include load difference features, by default True
     include_fourier : bool, optional
         Whether to include Fourier features, by default True
+    include_temperature_rates : bool, optional
+        Whether to include temperature rate features, by default True
+    include_extreme_temp : bool, optional
+        Whether to include extreme temperature features, by default True
+    include_trend_reversal : bool, optional
+        Whether to include trend reversal features, by default True
+    include_enhanced_load : bool, optional
+        Whether to include enhanced load features, by default True
     lag_columns : List[str], optional
         List of columns to create lag features for, by default None
         (uses ['OT', 'HUFL', 'MUFL', 'LUFL'] if None)
@@ -381,7 +823,7 @@ def build_feature_set(
     pd.DataFrame
         DataFrame with all selected features
     """
-    logger.info("Building comprehensive feature set")
+    logger.info("Building comprehensive feature set with enhanced features")
     
     if not isinstance(df.index, pd.DatetimeIndex):
         raise ValueError("DataFrame must have a DatetimeIndex")
@@ -421,9 +863,6 @@ def build_feature_set(
         fourier_order = {'daily': 4, 'weekly': 3, 'yearly': 5}
     
     # Apply feature engineering techniques
-    
-    # Before creating lag features, ensure source columns don't have NaN values
-    # as they will propagate to lag features
     if include_lag and lag_columns:
         # Check for NaN values in lag source columns
         lag_source_nans = result_df[lag_columns].isnull().sum()
@@ -596,15 +1035,60 @@ def build_feature_set(
         if diff_nan_count > last_count:
             logger.warning(f"Creating load difference features introduced new NaN values")
     
-    # Create Fourier features (these shouldn't create NaNs if the index is continuous)
-    if include_fourier:
-        result_df = create_fourier_features(result_df, fourier_periods, fourier_order)
+    # Add temperature rate features
+    if include_temperature_rates and 'OT' in result_df.columns:
+        logger.info("Adding temperature rate features")
+        result_df = create_temperature_rate_features(
+            result_df,
+            temperature_column='OT',
+            windows=[1, 2, 3, 6, 12, 24, 48]
+        )
+    
+    # Add extreme temperature features
+    if include_extreme_temp and 'OT' in result_df.columns:
+        logger.info("Adding extreme temperature features")
+        result_df = create_extreme_temperature_features(
+            result_df,
+            temperature_column='OT',
+            threshold_quantile=0.9,
+            windows=[24, 48, 72, 168]
+        )
+    
+    # Add trend reversal features
+    if include_trend_reversal:
+        trend_columns = ['OT'] if 'OT' in result_df.columns else []
         
-        # Check for NaNs after creating Fourier features
-        fourier_nan_count = result_df.isnull().sum().sum()
-        last_count = diff_nan_count if include_load_diff else (ratio_nan_count if include_load_ratio else (rolling_nan_count if include_rolling else (lag_nan_count if include_lag else initial_nan_count)))
-        if fourier_nan_count > last_count:
-            logger.warning(f"Creating Fourier features introduced new NaN values")
+        # Add load columns if available
+        load_columns = [col for col in ['HUFL', 'HULL', 'MUFL', 'MULL', 'LUFL', 'LULL'] 
+                        if col in result_df.columns]
+        trend_columns.extend(load_columns)
+        
+        if trend_columns:
+            logger.info(f"Adding trend reversal features for {len(trend_columns)} columns")
+            result_df = create_trend_reversal_features(
+                result_df,
+                columns=trend_columns,
+                windows=[6, 12, 24, 48]
+            )
+    
+    # Add enhanced load features
+    if include_enhanced_load:
+        logger.info("Adding enhanced load features")
+        result_df = create_enhanced_load_features(
+            result_df,
+            useful_load_columns=['HUFL', 'MUFL', 'LUFL'],
+            useless_load_columns=['HULL', 'MULL', 'LULL'],
+            windows=[4, 12, 24, 48]
+        )
+    
+    # Use enhanced Fourier features if include_fourier is True
+    if include_fourier:
+        logger.info("Using enhanced Fourier features instead of standard ones")
+        result_df = create_enhanced_fourier_features(
+            result_df,
+            periods=fourier_periods,
+            fourier_orders={'daily': 6, 'weekly': 4, 'yearly': 8}  # Higher orders
+        )
     
     # Handle missing values created during feature engineering with more advanced approach
     nan_count_before_final = result_df.isnull().sum().sum()
@@ -728,7 +1212,7 @@ def engineer_features(
     Tuple[pd.DataFrame, pd.DataFrame]
         Feature engineered training and testing DataFrames
     """
-    logger.info("Starting feature engineering process")
+    logger.info("Starting feature engineering process with enhanced features")
     
     # Load preprocessed data
     logger.info(f"Loading preprocessed training data from {input_train_path}")
@@ -747,11 +1231,21 @@ def engineer_features(
         logger.error(f"Error loading testing data: {str(e)}")
         raise
     
+    # Set enhanced feature engineering defaults if not provided
+    if 'include_temperature_rates' not in feature_args:
+        feature_args['include_temperature_rates'] = True
+    if 'include_extreme_temp' not in feature_args:
+        feature_args['include_extreme_temp'] = True
+    if 'include_trend_reversal' not in feature_args:
+        feature_args['include_trend_reversal'] = True
+    if 'include_enhanced_load' not in feature_args:
+        feature_args['include_enhanced_load'] = True
+    
     # Build feature sets
-    logger.info("Engineering features for training data")
+    logger.info("Engineering enhanced features for training data")
     train_features = build_feature_set(train_df, **feature_args)
     
-    logger.info("Engineering features for testing data")
+    logger.info("Engineering enhanced features for testing data")
     test_features = build_feature_set(test_df, **feature_args)
     
     # Save feature engineered data
@@ -764,6 +1258,22 @@ def engineer_features(
     try:
         train_features.to_csv(output_train_path)
         logger.info(f"Successfully saved training data with shape {train_features.shape}")
+        
+        # Save feature list for reference
+        feature_list_path = os.path.join(output_dir, "feature_list.json")
+        with open(feature_list_path, 'w') as f:
+            feature_dict = {
+                'all_features': train_features.columns.tolist(),
+                'original_features': train_df.columns.tolist(),
+                'engineered_features': [col for col in train_features.columns if col not in train_df.columns],
+                'feature_counts': {
+                    'total': len(train_features.columns),
+                    'original': len(train_df.columns),
+                    'engineered': len(train_features.columns) - len(train_df.columns)
+                }
+            }
+            json.dump(feature_dict, f, indent=4)
+        logger.info(f"Feature list saved to {feature_list_path}")
     except Exception as e:
         logger.error(f"Error saving training data: {str(e)}")
         raise
@@ -776,7 +1286,33 @@ def engineer_features(
         logger.error(f"Error saving testing data: {str(e)}")
         raise
     
-    logger.info("Feature engineering process completed")
+    # Create a feature importance analysis based on correlation with target
+    if 'OT' in train_features.columns:
+        logger.info("Analyzing feature importance based on correlation with target")
+        
+        # Calculate correlation with target
+        corr_with_target = train_features.corrwith(train_features['OT']).abs().sort_values(ascending=False)
+        
+        # Save top features by correlation
+        corr_path = os.path.join(output_dir, "feature_importance.json")
+        with open(corr_path, 'w') as f:
+            # Convert to dictionary with string keys and float values
+            corr_dict = {
+                'top_features': {str(k): float(v) for k, v in corr_with_target.head(30).items()},
+                'bottom_features': {str(k): float(v) for k, v in corr_with_target.tail(30).items()},
+                'feature_types': {
+                    'lag_features': [col for col in train_features.columns if 'lag' in col],
+                    'rolling_features': [col for col in train_features.columns if 'rolling' in col],
+                    'fourier_features': [col for col in train_features.columns if 'sin' in col or 'cos' in col],
+                    'trend_features': [col for col in train_features.columns if 'trend' in col],
+                    'extreme_features': [col for col in train_features.columns if 'extreme' in col],
+                    'rate_features': [col for col in train_features.columns if 'rate' in col or 'roc' in col]
+                }
+            }
+            json.dump(corr_dict, f, indent=4)
+        logger.info(f"Feature importance analysis saved to {corr_path}")
+    
+    logger.info("Enhanced feature engineering process completed")
     return train_features, test_features
 
 if __name__ == "__main__":
@@ -789,8 +1325,8 @@ if __name__ == "__main__":
     # Input/output paths
     input_train_path = project_dir / "data" / "preprocessed" / "train_processed.csv"
     input_test_path = project_dir / "data" / "preprocessed" / "test_processed.csv"
-    output_train_path = project_dir / "data" / "features" / "train_features.csv"
-    output_test_path = project_dir / "data" / "features" / "test_features.csv"
+    output_train_path = project_dir / "data" / "features" / "train_features_enhanced.csv"
+    output_test_path = project_dir / "data" / "features" / "test_features_enhanced.csv"
     
     # Create output directory if it doesn't exist
     output_dir = project_dir / "data" / "features"
@@ -801,7 +1337,7 @@ if __name__ == "__main__":
     print(f"Output train path: {output_train_path}")
     print(f"Output test path: {output_test_path}")
     
-    # Apply feature engineering
+    # Apply enhanced feature engineering
     train_features, test_features = engineer_features(
         input_train_path=str(input_train_path),
         input_test_path=str(input_test_path),
@@ -809,11 +1345,36 @@ if __name__ == "__main__":
         output_test_path=str(output_test_path),
         include_lag=True,
         lag_columns=['OT', 'HUFL', 'MUFL', 'LUFL'],
-        lag_periods=[1, 2, 3, 4, 6, 12, 24],
+        lag_periods=[1, 2, 3, 4, 6, 12, 24, 48],  # Added 48-hour lag
         include_rolling=True,
         rolling_columns=['OT'],
         rolling_windows=[4, 12, 24, 48, 168],
         include_load_ratio=True,
         include_load_diff=True,
-        include_fourier=True
+        include_fourier=True,
+        include_temperature_rates=True,
+        include_extreme_temp=True,
+        include_trend_reversal=True,
+        include_enhanced_load=True
     )
+    
+    # Print summary of generated features
+    print(f"Generated {train_features.shape[1]} features for training data")
+    
+    # Group features by type and count
+    feature_counts = {
+        'original': len([col for col in train_features.columns if col in ['OT', 'HUFL', 'HULL', 'MUFL', 'MULL', 'LUFL', 'LULL']]),
+        'lag': len([col for col in train_features.columns if 'lag' in col]),
+        'rolling': len([col for col in train_features.columns if 'rolling' in col]),
+        'fourier': len([col for col in train_features.columns if 'sin' in col or 'cos' in col]),
+        'load_ratio': len([col for col in train_features.columns if 'ratio' in col]),
+        'load_diff': len([col for col in train_features.columns if 'diff' in col and 'temperature' not in col]),
+        'temp_rate': len([col for col in train_features.columns if 'roc' in col or 'accel' in col or 'OT_diff' in col]),
+        'extreme': len([col for col in train_features.columns if 'extreme' in col or 'hours_since_extreme' in col]),
+        'trend': len([col for col in train_features.columns if 'trend' in col or 'oscillation' in col]),
+        'enhanced_load': len([col for col in train_features.columns if 'volatility' in col or 'momentum' in col or 'temp_corr' in col])
+    }
+    
+    print("Feature counts by type:")
+    for feat_type, count in feature_counts.items():
+        print(f"  {feat_type}: {count}")
