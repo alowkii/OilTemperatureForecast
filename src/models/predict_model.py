@@ -275,7 +275,7 @@ def forecast_future(
 def generate_future_timestamps(
     start_timestamp: pd.Timestamp,
     forecast_horizon: int,
-    freq: str = 'H'
+    freq: str = 'h'
 ) -> pd.DatetimeIndex:
     """
     Generate future timestamps for forecasts.
@@ -287,15 +287,31 @@ def generate_future_timestamps(
     forecast_horizon : int
         Number of future timestamps to generate
     freq : str, optional
-        Frequency of timestamps, by default 'H' (hourly)
+        Frequency of timestamps, by default 'h' (hourly)
         
     Returns
     -------
     pd.DatetimeIndex
         Future timestamps
     """
+    # Convert frequency to timedelta for the first step
+    if freq == 'h' or freq == 'H':
+        time_delta = pd.Timedelta(hours=1)
+    elif freq == 'd' or freq == 'D':
+        time_delta = pd.Timedelta(days=1)
+    elif freq == 'min' or freq == 'T':
+        time_delta = pd.Timedelta(minutes=1)
+    elif freq == '15min' or freq == '15T':
+        time_delta = pd.Timedelta(minutes=15)
+    elif freq == '30min' or freq == '30T':
+        time_delta = pd.Timedelta(minutes=30)
+    else:
+        # Default case
+        time_delta = pd.Timedelta(hours=1)
+        
+    # Generate future timestamps using date_range
     return pd.date_range(
-        start=start_timestamp + pd.Timedelta(freq),
+        start=start_timestamp + time_delta,
         periods=forecast_horizon,
         freq=freq
     )
@@ -308,7 +324,7 @@ def predict_dataset(
     feature_columns: List[str],
     target_column: str,
     scaler: Optional[Any] = None,
-    freq: str = 'H',
+    freq: str = 'h',
     return_actual: bool = True
 ) -> pd.DataFrame:
     """
@@ -331,7 +347,7 @@ def predict_dataset(
     scaler : Any, optional
         Fitted scaler, by default None
     freq : str, optional
-        Time series frequency, by default 'H' (hourly)
+        Time series frequency, by default 'h' (hourly)
     return_actual : bool, optional
         Whether to include actual values in output, by default True
         
@@ -374,12 +390,23 @@ def predict_dataset(
         )
         
         # Add actual values if requested and available
-        if return_actual:
+        if return_actual and target_column in df.columns:
             # Check if we have actual data for the forecast period
-            actual_data = df[target_column].loc[forecast_times] if forecast_times[0] in df.index else None
+            # Safely get actual data that exists in both forecast_times and df.index
+            actual_indices = forecast_times[forecast_times.isin(df.index)]
             
-            if actual_data is not None and len(actual_data) == forecast_horizon:
-                forecast_df['actual'] = actual_data.values
+            if len(actual_indices) > 0:
+                # Get values for indices that exist
+                actual_values = df.loc[actual_indices, target_column]
+                
+                # Create a Series with forecast_times as index, filled with NaN
+                all_actuals = pd.Series(index=forecast_times, dtype=float)
+                
+                # Fill in available values
+                all_actuals.loc[actual_indices] = actual_values
+                
+                # Add to forecast DataFrame
+                forecast_df['actual'] = all_actuals.values
         
         # Add sequence ID
         forecast_df['sequence_id'] = i
@@ -397,7 +424,7 @@ def predict_dataset(
     else:
         logger.warning("No predictions generated")
         return pd.DataFrame()
-
+    
 if __name__ == "__main__":
     # Example usage
     project_dir = Path(__file__).resolve().parents[2]
@@ -452,7 +479,7 @@ if __name__ == "__main__":
         feature_columns=feature_columns,
         target_column=target_column,
         scaler=scaler,
-        freq='H'  # Hourly data
+        freq='h'
     )
     
     # Save predictions
