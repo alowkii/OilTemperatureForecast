@@ -115,3 +115,11 @@ Based on the exploratory data analysis, here are key findings about the transfor
 ```bash
 python -m src.data.make_dataset
 ```
+
+## 3. Extract features:
+
+### Run:
+
+```bash
+python -m src.features.build_features
+```
