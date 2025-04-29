@@ -445,6 +445,10 @@ def save_model(
     # Create directory if it doesn't exist
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
     
+    # Create reports directory if needed
+    history_plot_dir = os.path.join(os.path.dirname(model_path), "report")
+    os.makedirs(history_plot_dir, exist_ok=True)
+    
     # Save model
     logger.info(f"Saving model to {model_path}")
     model.save(model_path)
@@ -452,25 +456,42 @@ def save_model(
     # Save training history and metrics
     history_path = os.path.splitext(model_path)[0] + '_history.json'
     
-    # Extract history dictionary for JSON serialization
-    history_dict = {k: list(map(float, v)) for k, v in training_info['history'].items()}
+    # Fix for NumPy types not being JSON serializable
+    def convert_to_serializable(obj):
+        if isinstance(obj, dict):
+            return {k: convert_to_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_to_serializable(item) for item in obj]
+        elif isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64, np.float32)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return convert_to_serializable(obj.tolist())
+        else:
+            return obj
+    
+    # Extract history dictionary and convert NumPy types
+    history_dict = {}
+    for k, v in training_info['history'].items():
+        history_dict[k] = [float(val) for val in v]
     
     # Create serializable training info
     serializable_info = {
         'history': history_dict,
-        'epochs_completed': training_info['epochs_completed'],
-        'best_epoch': training_info['best_epoch'],
+        'epochs_completed': int(training_info['epochs_completed']),
+        'best_epoch': int(training_info['best_epoch']),
         'best_val_loss': float(training_info['best_val_loss']),
         'best_val_mae': float(training_info['best_val_mae'])
     }
     
     # Add metadata if provided
     if metadata:
-        serializable_info['metadata'] = metadata
+        serializable_info['metadata'] = convert_to_serializable(metadata)
     
     # Add feature names if provided
     if feature_names:
-        serializable_info['feature_names'] = feature_names
+        serializable_info['feature_names'] = [str(f) for f in feature_names]
     
     # Save training info
     logger.info(f"Saving training history to {history_path}")
@@ -482,6 +503,13 @@ def save_model(
         logger.info(f"Saving scaler to {scaler_path}")
         with open(scaler_path, 'wb') as f:
             pickle.dump(scaler, f)
+    
+    # Plot and save training history
+    history_plot_path = os.path.join(history_plot_dir, "training_history.png")
+    plot_training_history(
+        history=history_dict,
+        output_path=history_plot_path
+    )
 
 def plot_training_history(
     history: Dict[str, List[float]],
