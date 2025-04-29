@@ -53,28 +53,47 @@ def calculate_metrics(
     # Check for NaN or infinity
     if np.isnan(y_true).any() or np.isnan(y_pred).any():
         logger.warning("NaN values found in inputs, metrics may be unreliable")
+        
+        # Create mask for valid values (where both y_true and y_pred are not NaN)
+        mask = ~(np.isnan(y_true) | np.isnan(y_pred))
+        
+        # Filter out NaN values for calculations
+        y_true_valid = y_true[mask]
+        y_pred_valid = y_pred[mask]
+        
+        if len(y_true_valid) == 0:
+            logger.error("No valid data points after removing NaNs")
+            return {
+                'MAE': np.nan,
+                'RMSE': np.nan,
+                'MAPE': np.nan,
+                'R2': np.nan
+            }
+    else:
+        y_true_valid = y_true
+        y_pred_valid = y_pred
     
     # Initialize metrics dictionary
     metrics = {}
     
     # Mean Absolute Error (MAE)
-    mae = mean_absolute_error(y_true, y_pred, multioutput=multioutput)
+    mae = mean_absolute_error(y_true_valid, y_pred_valid, multioutput=multioutput)
     
     # Root Mean Squared Error (RMSE)
-    mse = mean_squared_error(y_true, y_pred, multioutput=multioutput)
+    mse = mean_squared_error(y_true_valid, y_pred_valid, multioutput=multioutput)
     rmse = np.sqrt(mse)
     
     # Mean Absolute Percentage Error (MAPE)
     # Handle division by zero
-    mask = y_true != 0
+    mask = y_true_valid != 0
     if mask.any():
-        mape = np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+        mape = np.mean(np.abs((y_true_valid[mask] - y_pred_valid[mask]) / y_true_valid[mask])) * 100
     else:
         mape = np.nan
         logger.warning("Cannot calculate MAPE due to zero values in y_true")
     
     # R-squared
-    r2 = r2_score(y_true, y_pred, multioutput=multioutput)
+    r2 = r2_score(y_true_valid, y_pred_valid, multioutput=multioutput)
     
     # Add metrics to dictionary
     if multioutput == 'raw_values':
@@ -128,10 +147,30 @@ def evaluate_model(
     if pred_column not in predictions_df.columns:
         raise ValueError(f"Prediction column '{pred_column}' not found in DataFrame")
     
-    # Calculate overall metrics
+    # Make a copy of the DataFrame to avoid modifying the original
+    pred_df = predictions_df.copy()
+    
+    # Drop rows where either actual or predicted values are NaN before overall evaluation
+    valid_rows = ~(pred_df[actual_column].isna() | pred_df[pred_column].isna())
+    valid_df = pred_df[valid_rows]
+    
+    if len(valid_df) == 0:
+        logger.warning("No valid data points after removing NaNs")
+        return {
+            'overall': {
+                'MAE': np.nan,
+                'RMSE': np.nan,
+                'MAPE': np.nan,
+                'R2': np.nan
+            },
+            'by_horizon': {},
+            'by_time': {}
+        }
+    
+    # Calculate overall metrics on valid data
     overall_metrics = calculate_metrics(
-        predictions_df[actual_column].values,
-        predictions_df[pred_column].values
+        valid_df[actual_column].values,
+        valid_df[pred_column].values
     )
     
     logger.info(f"Overall metrics: MAE={overall_metrics['MAE']:.4f}, RMSE={overall_metrics['RMSE']:.4f}, MAPE={overall_metrics['MAPE']:.2f}%")
@@ -143,9 +182,9 @@ def evaluate_model(
     }
     
     # Calculate metrics by forecast horizon
-    if by_horizon and 'sequence_id' in predictions_df.columns:
+    if by_horizon and 'sequence_id' in pred_df.columns:
         # Group by sequence_id and calculate position in sequence
-        grouped = predictions_df.groupby('sequence_id')
+        grouped = pred_df.groupby('sequence_id')
         
         # Calculate metrics for each horizon
         horizon_metrics = {}
@@ -164,33 +203,45 @@ def evaluate_model(
                         'predicted': []
                     }
                 
-                horizon_metrics[horizon]['actual'].extend(horizon_group[actual_column].values)
-                horizon_metrics[horizon]['predicted'].extend(horizon_group[pred_column].values)
+                # Add non-NaN values to the lists
+                valid_horizon_rows = ~(horizon_group[actual_column].isna() | horizon_group[pred_column].isna())
+                valid_horizon_group = horizon_group[valid_horizon_rows]
+                
+                horizon_metrics[horizon]['actual'].extend(valid_horizon_group[actual_column].values)
+                horizon_metrics[horizon]['predicted'].extend(valid_horizon_group[pred_column].values)
         
-        # Calculate metrics for each horizon
+        # Calculate metrics for each horizon if there are valid data points
         for horizon, data in horizon_metrics.items():
-            metrics = calculate_metrics(
-                np.array(data['actual']),
-                np.array(data['predicted'])
-            )
-            results['by_horizon'][horizon] = metrics
+            if len(data['actual']) > 0:
+                metrics = calculate_metrics(
+                    np.array(data['actual']),
+                    np.array(data['predicted'])
+                )
+                results['by_horizon'][horizon] = metrics
+            else:
+                results['by_horizon'][horizon] = {
+                    'MAE': np.nan,
+                    'RMSE': np.nan,
+                    'MAPE': np.nan,
+                    'R2': np.nan
+                }
         
         logger.info(f"Calculated metrics by horizon for {len(horizon_metrics)} horizons")
     
     # Calculate metrics by time period
     if by_time:
         # Create time features
-        if isinstance(predictions_df.index, pd.DatetimeIndex):
+        if isinstance(pred_df.index, pd.DatetimeIndex):
             if by_time == 'hour':
-                predictions_df['time_group'] = predictions_df.index.hour
+                pred_df['time_group'] = pred_df.index.hour
             elif by_time == 'day':
-                predictions_df['time_group'] = predictions_df.index.day
+                pred_df['time_group'] = pred_df.index.day
             elif by_time == 'month':
-                predictions_df['time_group'] = predictions_df.index.month
+                pred_df['time_group'] = pred_df.index.month
             elif by_time == 'season':
                 # Define seasons (Northern Hemisphere)
-                month = predictions_df.index.month
-                predictions_df['time_group'] = np.select(
+                month = pred_df.index.month
+                pred_df['time_group'] = np.select(
                     [
                         (month >= 3) & (month <= 5),    # Spring
                         (month >= 6) & (month <= 8),    # Summer
@@ -200,18 +251,30 @@ def evaluate_model(
                     ['Spring', 'Summer', 'Fall', 'Winter']
                 )
             elif by_time == 'weekday':
-                predictions_df['time_group'] = predictions_df.index.dayofweek
+                pred_df['time_group'] = pred_df.index.dayofweek
             else:
                 logger.warning(f"Unsupported time grouping: {by_time}")
                 return results
             
             # Calculate metrics for each time group
-            for time_group, group in predictions_df.groupby('time_group'):
-                metrics = calculate_metrics(
-                    group[actual_column].values,
-                    group[pred_column].values
-                )
-                results['by_time'][time_group] = metrics
+            for time_group, group in pred_df.groupby('time_group'):
+                # Filter valid rows in this time group
+                valid_group_rows = ~(group[actual_column].isna() | group[pred_column].isna())
+                valid_group = group[valid_group_rows]
+                
+                if len(valid_group) > 0:
+                    metrics = calculate_metrics(
+                        valid_group[actual_column].values,
+                        valid_group[pred_column].values
+                    )
+                    results['by_time'][time_group] = metrics
+                else:
+                    results['by_time'][time_group] = {
+                        'MAE': np.nan,
+                        'RMSE': np.nan,
+                        'MAPE': np.nan,
+                        'R2': np.nan
+                    }
             
             logger.info(f"Calculated metrics by {by_time} for {len(results['by_time'])} groups")
         else:
@@ -282,18 +345,32 @@ def plot_predictions(
         seq_data = predictions_df[predictions_df[sequence_id_column] == seq_id].sort_index()
         
         ax = axes[i]
-        ax.plot(seq_data.index, seq_data[pred_column], 'r-', label='Predicted')
+        
+        # Plot predictions, handle NaN values by masking them
+        pred_mask = ~np.isnan(seq_data[pred_column].values)
+        if pred_mask.any():
+            ax.plot(seq_data.index[pred_mask], seq_data[pred_column].values[pred_mask], 'r-', label='Predicted')
         
         if has_actual:
-            ax.plot(seq_data.index, seq_data[actual_column], 'b-', label='Actual')
+            # Plot actual values, handle NaN values by masking them
+            actual_mask = ~np.isnan(seq_data[actual_column].values)
+            if actual_mask.any():
+                ax.plot(seq_data.index[actual_mask], seq_data[actual_column].values[actual_mask], 'b-', label='Actual')
         
         # Calculate metrics for this sequence if actual values exist
         if has_actual:
-            metrics = calculate_metrics(
-                seq_data[actual_column].values,
-                seq_data[pred_column].values
-            )
-            title = f"Sequence {seq_id}: MAE={metrics['MAE']:.4f}, RMSE={metrics['RMSE']:.4f}, MAPE={metrics['MAPE']:.2f}%"
+            # Get only rows where both actual and predicted are not NaN
+            valid_rows = ~(seq_data[actual_column].isna() | seq_data[pred_column].isna())
+            valid_data = seq_data[valid_rows]
+            
+            if len(valid_data) > 0:
+                metrics = calculate_metrics(
+                    valid_data[actual_column].values,
+                    valid_data[pred_column].values
+                )
+                title = f"Sequence {seq_id}: MAE={metrics['MAE']:.4f}, RMSE={metrics['RMSE']:.4f}, MAPE={metrics['MAPE']:.2f}%"
+            else:
+                title = f"Sequence {seq_id}: No valid data points for metrics"
         else:
             title = f"Sequence {seq_id}"
         
@@ -536,11 +613,58 @@ def analyze_extreme_cases(
     if pred_column not in predictions_df.columns:
         raise ValueError(f"Prediction column '{pred_column}' not found in DataFrame")
     
+    # Filter out rows with NaN values
+    valid_rows = ~(predictions_df[actual_column].isna() | predictions_df[pred_column].isna())
+    valid_df = predictions_df[valid_rows].copy()
+    
+    if len(valid_df) == 0:
+        logger.warning("No valid data points after removing NaNs for extreme case analysis")
+        return {
+            'mean_error': np.nan,
+            'median_error': np.nan,
+            'std_error': np.nan,
+            'max_underestimation': np.nan,
+            'max_overestimation': np.nan,
+            'mean_abs_error': np.nan,
+            'median_abs_error': np.nan,
+            'mean_pct_error': np.nan,
+            'threshold_temperature': np.nan,
+            'num_extreme_cases': 0,
+            'extreme_metrics': {
+                'MAE': np.nan,
+                'RMSE': np.nan,
+                'MAPE': np.nan,
+                'R2': np.nan
+            }
+        }
+    
     # Define extreme cases
-    threshold = np.percentile(predictions_df[actual_column], percentile_threshold)
-    extreme_cases = predictions_df[predictions_df[actual_column] >= threshold].copy()
+    threshold = np.percentile(valid_df[actual_column], percentile_threshold)
+    extreme_cases = valid_df[valid_df[actual_column] >= threshold].copy()
     
     logger.info(f"Analyzing {len(extreme_cases)} extreme cases (>= {threshold:.2f}°C)")
+    
+    # Handle case with no extreme cases
+    if len(extreme_cases) == 0:
+        logger.warning(f"No extreme cases found above the {percentile_threshold}th percentile ({threshold:.2f}°C)")
+        return {
+            'mean_error': np.nan,
+            'median_error': np.nan,
+            'std_error': np.nan,
+            'max_underestimation': np.nan,
+            'max_overestimation': np.nan,
+            'mean_abs_error': np.nan,
+            'median_abs_error': np.nan,
+            'mean_pct_error': np.nan,
+            'threshold_temperature': float(threshold),
+            'num_extreme_cases': 0,
+            'extreme_metrics': {
+                'MAE': np.nan,
+                'RMSE': np.nan,
+                'MAPE': np.nan,
+                'R2': np.nan
+            }
+        }
     
     # Calculate metrics for extreme cases
     extreme_metrics = calculate_metrics(

@@ -75,7 +75,8 @@ def prepare_data_for_prediction(
     df: pd.DataFrame,
     sequence_length: int,
     feature_columns: List[str],
-    scaler: Optional[Any] = None
+    scaler: Optional[Any] = None,
+    handle_nans: bool = True
 ) -> Tuple[np.ndarray, pd.DatetimeIndex]:
     """
     Prepare data for making predictions with LSTM model.
@@ -90,6 +91,8 @@ def prepare_data_for_prediction(
         List of feature columns to use
     scaler : Any, optional
         Fitted scaler for normalization, by default None
+    handle_nans : bool, optional
+        Whether to handle NaN values before creating sequences, by default True
         
     Returns
     -------
@@ -106,6 +109,29 @@ def prepare_data_for_prediction(
     
     # Ensure data is sorted by index
     data = data.sort_index()
+    
+    # Check for NaN values in feature columns
+    nan_count = data[feature_columns].isna().sum().sum()
+    if nan_count > 0:
+        logger.warning(f"Found {nan_count} NaN values in feature columns")
+        
+        if handle_nans:
+            logger.info("Handling NaN values in features")
+            # First try forward fill with a limit
+            data[feature_columns] = data[feature_columns].ffill(limit=12)
+            
+            # Then use interpolation for remaining NaNs
+            if data[feature_columns].isna().sum().sum() > 0:
+                data[feature_columns] = data[feature_columns].interpolate(method='time')
+            
+            # Finally use backward fill for any remaining NaNs (usually at the beginning)
+            if data[feature_columns].isna().sum().sum() > 0:
+                data[feature_columns] = data[feature_columns].bfill()
+            
+            # Check if we still have NaNs
+            remaining_nans = data[feature_columns].isna().sum().sum()
+            if remaining_nans > 0:
+                logger.warning(f"Still have {remaining_nans} NaN values after handling")
     
     # Scale data if scaler is provided
     if scaler:
@@ -126,11 +152,23 @@ def prepare_data_for_prediction(
     
     # For prediction, we create sequences but no targets (since we're predicting them)
     for i in range(len(data) - sequence_length + 1):
-        X_sequences.append(X_values[i:i+sequence_length])
+        seq = X_values[i:i+sequence_length]
+        
+        # Skip sequences with NaN values
+        if np.isnan(seq).any():
+            logger.debug(f"Skipping sequence at position {i} due to NaN values")
+            continue
+            
+        X_sequences.append(seq)
         # Store the timestamp of the last point in the input sequence
         timestamps.append(data.index[i+sequence_length-1])
     
     logger.info(f"Created {len(X_sequences)} prediction sequences")
+    
+    if len(X_sequences) == 0:
+        logger.warning("No valid sequences could be created due to NaN values")
+        # Return empty arrays with correct shapes
+        return np.empty((0, sequence_length, len(feature_columns))), pd.DatetimeIndex([])
     
     return np.array(X_sequences), pd.DatetimeIndex(timestamps)
 
@@ -325,7 +363,8 @@ def predict_dataset(
     target_column: str,
     scaler: Optional[Any] = None,
     freq: str = 'h',
-    return_actual: bool = True
+    return_actual: bool = True,
+    handle_nans: bool = True
 ) -> pd.DataFrame:
     """
     Make predictions for an entire dataset and return results as a DataFrame.
@@ -350,6 +389,8 @@ def predict_dataset(
         Time series frequency, by default 'h' (hourly)
     return_actual : bool, optional
         Whether to include actual values in output, by default True
+    handle_nans : bool, optional
+        Whether to handle NaN values before prediction, by default True
         
     Returns
     -------
@@ -358,14 +399,44 @@ def predict_dataset(
     """
     logger.info(f"Predicting for dataset with {len(df)} rows")
     
-    # Prepare data for prediction
+    # Handle NaNs in input data if requested
+    data = df.copy()
+    if handle_nans:
+        # Check for NaN values in feature columns
+        nan_count = data[feature_columns].isna().sum().sum()
+        if nan_count > 0:
+            logger.warning(f"Found {nan_count} NaN values in feature columns")
+            logger.info("Handling NaN values in features")
+            
+            # First try forward fill with a limit
+            data[feature_columns] = data[feature_columns].ffill(limit=12)
+            
+            # Then use interpolation for remaining NaNs
+            if data[feature_columns].isna().sum().sum() > 0:
+                data[feature_columns] = data[feature_columns].interpolate(method='time')
+            
+            # Finally use backward fill for any remaining NaNs (usually at the beginning)
+            if data[feature_columns].isna().sum().sum() > 0:
+                data[feature_columns] = data[feature_columns].bfill()
+            
+            # Check if we still have NaNs
+            remaining_nans = data[feature_columns].isna().sum().sum()
+            if remaining_nans > 0:
+                logger.warning(f"Still have {remaining_nans} NaN values after handling")
+    
+    # Prepare data for prediction (passing updated handle_nans parameter)
     X, timestamps = prepare_data_for_prediction(
-        df, sequence_length, feature_columns, scaler
+        data, sequence_length, feature_columns, scaler, handle_nans=handle_nans
     )
+    
+    # Check if we have any valid sequences
+    if len(X) == 0:
+        logger.warning("No valid sequences could be created due to NaN values")
+        return pd.DataFrame()
     
     # Get target column index for denormalization
     if scaler:
-        target_idx = list(df.columns).index(target_column)
+        target_idx = list(data.columns).index(target_column)
     else:
         target_idx = None
     
@@ -390,14 +461,14 @@ def predict_dataset(
         )
         
         # Add actual values if requested and available
-        if return_actual and target_column in df.columns:
+        if return_actual and target_column in data.columns:
             # Check if we have actual data for the forecast period
             # Safely get actual data that exists in both forecast_times and df.index
-            actual_indices = forecast_times[forecast_times.isin(df.index)]
+            actual_indices = forecast_times[forecast_times.isin(data.index)]
             
             if len(actual_indices) > 0:
                 # Get values for indices that exist
-                actual_values = df.loc[actual_indices, target_column]
+                actual_values = data.loc[actual_indices, target_column]
                 
                 # Create a Series with forecast_times as index, filled with NaN
                 all_actuals = pd.Series(index=forecast_times, dtype=float)

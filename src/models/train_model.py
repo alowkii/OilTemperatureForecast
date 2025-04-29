@@ -36,7 +36,8 @@ def create_sequences(
     sequence_length: int,
     forecast_horizon: int,
     step: int = 1,
-    feature_columns: Optional[List[str]] = None
+    feature_columns: Optional[List[str]] = None,
+    handle_nans: bool = True
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
     Create input/output sequences for time series forecasting.
@@ -55,6 +56,8 @@ def create_sequences(
         Step size between consecutive sequences, by default 1
     feature_columns : List[str], optional
         List of feature columns to include, by default None (uses all columns except target)
+    handle_nans : bool, optional
+        Whether to handle NaN values before creating sequences, by default True
         
     Returns
     -------
@@ -81,6 +84,47 @@ def create_sequences(
     # Ensure data is sorted by index
     data = data.sort_index()
     
+    # Check for NaN values in feature columns and target
+    feature_nan_count = data[feature_columns].isna().sum().sum()
+    target_nan_count = data[target_column].isna().sum()
+    
+    if feature_nan_count > 0 or target_nan_count > 0:
+        logger.warning(f"Found {feature_nan_count} NaN values in features and {target_nan_count} in target")
+        
+        if handle_nans:
+            logger.info("Handling NaN values in features and target")
+            
+            # Handle NaNs in features
+            if feature_nan_count > 0:
+                # First try forward fill with a limit
+                data[feature_columns] = data[feature_columns].ffill(limit=12)
+                
+                # Then use interpolation for remaining NaNs
+                if data[feature_columns].isna().sum().sum() > 0:
+                    data[feature_columns] = data[feature_columns].interpolate(method='time')
+                
+                # Finally use backward fill for any remaining NaNs (usually at beginning)
+                if data[feature_columns].isna().sum().sum() > 0:
+                    data[feature_columns] = data[feature_columns].bfill()
+            
+            # Handle NaNs in target - important for training sequences
+            if target_nan_count > 0:
+                # Apply same approach to target
+                data[target_column] = data[target_column].ffill(limit=12)
+                
+                if data[target_column].isna().sum() > 0:
+                    data[target_column] = data[target_column].interpolate(method='time')
+                
+                if data[target_column].isna().sum() > 0:
+                    data[target_column] = data[target_column].bfill()
+            
+            # Check if we still have NaNs
+            remaining_feature_nans = data[feature_columns].isna().sum().sum()
+            remaining_target_nans = data[target_column].isna().sum()
+            
+            if remaining_feature_nans > 0 or remaining_target_nans > 0:
+                logger.warning(f"Still have {remaining_feature_nans} NaN values in features and {remaining_target_nans} in target after handling")
+    
     # Get target and feature values
     y_values = data[target_column].values
     X_values = data[feature_columns].values
@@ -90,10 +134,25 @@ def create_sequences(
     
     # Create sequences
     for i in range(0, len(data) - sequence_length - forecast_horizon + 1, step):
-        X_sequences.append(X_values[i:i+sequence_length])
-        y_sequences.append(y_values[i+sequence_length:i+sequence_length+forecast_horizon])
+        X_seq = X_values[i:i+sequence_length]
+        y_seq = y_values[i+sequence_length:i+sequence_length+forecast_horizon]
+        
+        # Skip sequences with NaN values
+        if np.isnan(X_seq).any() or np.isnan(y_seq).any():
+            logger.debug(f"Skipping sequence at position {i} due to NaN values")
+            continue
+            
+        X_sequences.append(X_seq)
+        y_sequences.append(y_seq)
     
     logger.info(f"Created {len(X_sequences)} sequences")
+    
+    if len(X_sequences) == 0:
+        logger.warning("No valid sequences could be created due to NaN values")
+        # Return empty arrays with correct shapes
+        return (np.empty((0, sequence_length, len(feature_columns))), 
+                np.empty((0, forecast_horizon)), 
+                feature_columns)
     
     return np.array(X_sequences), np.array(y_sequences), feature_columns
 

@@ -83,7 +83,8 @@ def preprocess_data(
     convert_date: bool = True,
     handle_missing: bool = True,
     handle_outliers: bool = True,
-    resample_freq: Optional[str] = None
+    resample_freq: Optional[str] = None,
+    max_gap_limit: int = 24  # New parameter for maximum gap size to fill
 ) -> pd.DataFrame:
     """
     Preprocess transformer oil temperature data.
@@ -100,6 +101,8 @@ def preprocess_data(
         Whether to handle outliers, by default True
     resample_freq : str, optional
         Frequency for resampling, e.g., '15T' for 15 minutes, by default None
+    max_gap_limit : int, optional
+        Maximum size of gaps (in time steps) to fill using interpolation, by default 24
         
     Returns
     -------
@@ -125,27 +128,82 @@ def preprocess_data(
     if missing_values.sum() > 0:
         logger.info(f"Missing values per column: \n{missing_values[missing_values > 0]}")
     
-    # Handle missing values
+    # Handle missing values with improved approach
     if handle_missing:
         logger.info("Handling missing values")
-        # Forward fill small gaps (up to 4 time steps)
-        # Using ffill() instead of fillna(method='ffill') to avoid deprecation warning
-        processed_df = processed_df.ffill(limit=4)
         
-        # If there are still missing values, use interpolation
+        # Forward fill small gaps (up to 4 time steps)
+        initial_missing = processed_df.isnull().sum().sum()
+        processed_df = processed_df.ffill(limit=4)
+        after_ffill_missing = processed_df.isnull().sum().sum()
+        logger.info(f"Forward fill reduced missing values from {initial_missing} to {after_ffill_missing}")
+        
+        # If there are still missing values, use interpolation with max_gap_limit
         if processed_df.isnull().sum().sum() > 0:
-            logger.info("Using time interpolation for remaining missing values")
-            processed_df = processed_df.interpolate(method='time')
+            logger.info(f"Using time interpolation with max gap limit of {max_gap_limit}")
+            
+            # For each column, interpolate but only for gaps smaller than max_gap_limit
+            for col in processed_df.columns:
+                # Get series with NaN values
+                series = processed_df[col]
+                
+                # If the series has NaNs
+                if series.isnull().any():
+                    # Find runs of NaNs
+                    mask = series.isnull()
+                    
+                    # Calculate runs of consecutive NaNs
+                    # This works by taking the difference of cumulative sum of mask changes
+                    runs = mask.ne(mask.shift()).cumsum()
+                    
+                    # Group by runs and get the size of each run
+                    run_sizes = mask.groupby(runs).sum()
+                    
+                    # Find runs that are too large to interpolate
+                    large_gaps = run_sizes[run_sizes > max_gap_limit].index
+                    
+                    if not large_gaps.empty:
+                        # Get the indices of large gaps
+                        large_gap_indices = mask[runs.isin(large_gaps)].index
+                        logger.warning(f"Column '{col}' has {len(large_gaps)} gaps larger than {max_gap_limit} time steps")
+                        
+                        # Make a temporary copy of the series without large gaps for interpolation
+                        temp_series = series.copy()
+                        
+                        # Interpolate the temporary series (ignoring large gaps)
+                        temp_series = temp_series.interpolate(method='time')
+                        
+                        # Copy interpolated values back to original series, but only for small gaps
+                        small_gap_mask = mask & ~runs.isin(large_gaps)
+                        processed_df.loc[small_gap_mask, col] = temp_series.loc[small_gap_mask]
+                    else:
+                        # No large gaps, just interpolate
+                        processed_df[col] = series.interpolate(method='time')
+            
+            after_interp_missing = processed_df.isnull().sum().sum()
+            logger.info(f"Interpolation reduced missing values from {after_ffill_missing} to {after_interp_missing}")
             
             # For any remaining missing values at the beginning, use backward fill
             if processed_df.isnull().sum().sum() > 0:
-                processed_df = processed_df.bfill()
-                logger.info("Used backward fill for missing values at beginning of time series")
+                processed_df = processed_df.bfill(limit=4)
+                after_bfill_missing = processed_df.isnull().sum().sum()
+                logger.info(f"Backward fill reduced missing values from {after_interp_missing} to {after_bfill_missing}")
+                
+                # Report any remaining missing values
+                if after_bfill_missing > 0:
+                    missing_by_col = processed_df.isnull().sum()
+                    cols_with_missing = missing_by_col[missing_by_col > 0]
+                    logger.warning(f"After all imputation steps, still have missing values: \n{cols_with_missing}")
     
     # Handle outliers
     if handle_outliers:
         logger.info("Detecting and handling outliers")
         for column in processed_df.select_dtypes(include=[np.number]).columns:
+            # Skip columns with NaN values for outlier detection
+            if processed_df[column].isnull().any():
+                logger.warning(f"Column '{column}' has NaN values, skipping outlier detection")
+                continue
+                
             # Calculate z-scores
             z_scores = np.abs((processed_df[column] - processed_df[column].mean()) / processed_df[column].std())
             
@@ -156,7 +214,6 @@ def preprocess_data(
                 logger.info(f"Found {outliers.sum()} outliers in column '{column}'")
                 
                 # Replace outliers with column median as a safer approach
-                # This avoids the window-based approach that caused the error
                 column_median = processed_df[column].median()
                 processed_df.loc[outliers, column] = column_median
                 logger.info(f"Replaced outliers in '{column}' with median value: {column_median}")
@@ -177,6 +234,16 @@ def preprocess_data(
             processed_df = processed_df.interpolate(method='time')
             logger.info("Interpolated missing values after resampling")
     
+    # Final check for NaN values
+    final_nan_count = processed_df.isnull().sum().sum()
+    if final_nan_count > 0:
+        logger.warning(f"Preprocessing complete but still have {final_nan_count} NaN values")
+        missing_by_col = processed_df.isnull().sum()
+        cols_with_missing = missing_by_col[missing_by_col > 0]
+        logger.warning(f"Columns with missing values: \n{cols_with_missing}")
+    else:
+        logger.info("Preprocessing complete with no remaining NaN values")
+        
     logger.info(f"Preprocessing complete, final shape: {processed_df.shape}")
     return processed_df
 

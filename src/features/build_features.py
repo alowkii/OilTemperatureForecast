@@ -335,7 +335,8 @@ def build_feature_set(
     rolling_columns: Optional[List[str]] = None,
     rolling_windows: Optional[List[int]] = None,
     fourier_periods: Optional[Dict[str, int]] = None,
-    fourier_order: Optional[Dict[str, int]] = None
+    fourier_order: Optional[Dict[str, int]] = None,
+    max_gap_limit: int = 24  # New parameter for maximum gap size to fill
 ) -> pd.DataFrame:
     """
     Build a comprehensive feature set by applying multiple feature engineering techniques.
@@ -372,6 +373,8 @@ def build_feature_set(
     fourier_order : Dict[str, int], optional
         Dictionary mapping period names to Fourier order, by default None
         (uses {'daily': 4, 'weekly': 3, 'yearly': 5} if None)
+    max_gap_limit : int, optional
+        Maximum size of gaps (in time steps) to fill using interpolation, by default 24
         
     Returns
     -------
@@ -382,6 +385,14 @@ def build_feature_set(
     
     if not isinstance(df.index, pd.DatetimeIndex):
         raise ValueError("DataFrame must have a DatetimeIndex")
+    
+    # Check for NaN values before starting feature engineering
+    initial_nan_count = df.isnull().sum().sum()
+    if initial_nan_count > 0:
+        logger.warning(f"Input data contains {initial_nan_count} NaN values before feature engineering")
+        missing_by_col = df.isnull().sum()
+        cols_with_missing = missing_by_col[missing_by_col > 0]
+        logger.warning(f"Columns with missing values: \n{cols_with_missing}")
     
     # Make a copy of the input DataFrame
     result_df = df.copy()
@@ -410,34 +421,281 @@ def build_feature_set(
         fourier_order = {'daily': 4, 'weekly': 3, 'yearly': 5}
     
     # Apply feature engineering techniques
+    
+    # Before creating lag features, ensure source columns don't have NaN values
+    # as they will propagate to lag features
     if include_lag and lag_columns:
+        # Check for NaN values in lag source columns
+        lag_source_nans = result_df[lag_columns].isnull().sum()
+        lag_cols_with_nans = lag_source_nans[lag_source_nans > 0]
+        
+        if not lag_cols_with_nans.empty:
+            logger.warning(f"Source columns for lag features contain NaN values: \n{lag_cols_with_nans}")
+            logger.info("Filling NaN values in lag source columns before creating lag features")
+            
+            for col in lag_cols_with_nans.index:
+                # First try forward fill with a limit
+                result_df[col] = result_df[col].ffill(limit=12)
+                
+                # Then use interpolation for remaining NaNs, but only for small gaps
+                if result_df[col].isnull().sum() > 0:
+                    # Find runs of NaNs
+                    mask = result_df[col].isnull()
+                    runs = mask.ne(mask.shift()).cumsum()
+                    run_sizes = mask.groupby(runs).sum()
+                    
+                    # Find runs that are too large to interpolate
+                    large_gaps = run_sizes[run_sizes > max_gap_limit].index
+                    
+                    if not large_gaps.empty:
+                        # Get the indices of large gaps
+                        large_gap_indices = mask[runs.isin(large_gaps)].index
+                        logger.warning(f"Column '{col}' has {len(large_gaps)} gaps larger than {max_gap_limit} time steps")
+                        
+                        # Make a temporary copy of the series without large gaps for interpolation
+                        temp_series = result_df[col].copy()
+                        
+                        # Interpolate the temporary series (ignoring large gaps)
+                        temp_series = temp_series.interpolate(method='time')
+                        
+                        # Copy interpolated values back to original series, but only for small gaps
+                        small_gap_mask = mask & ~runs.isin(large_gaps)
+                        result_df.loc[small_gap_mask, col] = temp_series.loc[small_gap_mask]
+                    else:
+                        # No large gaps, just interpolate
+                        result_df[col] = result_df[col].interpolate(method='time')
+                
+                # For any remaining missing values, use backward fill with limit
+                if result_df[col].isnull().sum() > 0:
+                    result_df[col] = result_df[col].bfill(limit=12)
+                
+                # If there are still NaNs, fill with column median or mean
+                if result_df[col].isnull().sum() > 0:
+                    if result_df[col].notnull().sum() > 0:  # Make sure we have some non-NaN values
+                        fill_value = result_df[col].median()
+                        result_df[col] = result_df[col].fillna(fill_value)
+                        logger.info(f"Filled remaining NaNs in column '{col}' with median: {fill_value}")
+                    else:
+                        # If all values are NaN, use 0 (but this is a serious issue)
+                        logger.warning(f"Column '{col}' contains all NaNs, filling with 0")
+                        result_df[col] = result_df[col].fillna(0)
+        
+        # Now create lag features
         result_df = create_lag_features(result_df, lag_columns, lag_periods)
+        
+        # Check for NaNs after creating lag features
+        lag_nan_count = result_df.isnull().sum().sum()
+        if lag_nan_count > initial_nan_count:
+            logger.warning(f"Creating lag features introduced {lag_nan_count - initial_nan_count} new NaN values")
     
+    # Similarly, ensure rolling feature source columns don't have NaNs
     if include_rolling and rolling_columns:
+        # Check for NaN values in rolling source columns
+        rolling_source_nans = result_df[rolling_columns].isnull().sum()
+        rolling_cols_with_nans = rolling_source_nans[rolling_source_nans > 0]
+        
+        if not rolling_cols_with_nans.empty:
+            logger.warning(f"Source columns for rolling features contain NaN values: \n{rolling_cols_with_nans}")
+            logger.info("Filling NaN values in rolling source columns before creating rolling features")
+            
+            for col in rolling_cols_with_nans.index:
+                # Similar approach to lag columns
+                result_df[col] = result_df[col].ffill(limit=12)
+                
+                if result_df[col].isnull().sum() > 0:
+                    # Interpolate but only for small gaps
+                    mask = result_df[col].isnull()
+                    runs = mask.ne(mask.shift()).cumsum()
+                    run_sizes = mask.groupby(runs).sum()
+                    large_gaps = run_sizes[run_sizes > max_gap_limit].index
+                    
+                    if not large_gaps.empty:
+                        logger.warning(f"Column '{col}' has {len(large_gaps)} gaps larger than {max_gap_limit} time steps")
+                        temp_series = result_df[col].copy()
+                        temp_series = temp_series.interpolate(method='time')
+                        small_gap_mask = mask & ~runs.isin(large_gaps)
+                        result_df.loc[small_gap_mask, col] = temp_series.loc[small_gap_mask]
+                    else:
+                        result_df[col] = result_df[col].interpolate(method='time')
+                
+                if result_df[col].isnull().sum() > 0:
+                    result_df[col] = result_df[col].bfill(limit=12)
+                
+                if result_df[col].isnull().sum() > 0:
+                    if result_df[col].notnull().sum() > 0:
+                        fill_value = result_df[col].median()
+                        result_df[col] = result_df[col].fillna(fill_value)
+                        logger.info(f"Filled remaining NaNs in column '{col}' with median: {fill_value}")
+                    else:
+                        logger.warning(f"Column '{col}' contains all NaNs, filling with 0")
+                        result_df[col] = result_df[col].fillna(0)
+        
+        # Now create rolling features
         result_df = create_rolling_features(result_df, rolling_columns, rolling_windows)
+        
+        # Check for NaNs after creating rolling features
+        rolling_nan_count = result_df.isnull().sum().sum()
+        if rolling_nan_count > lag_nan_count if include_lag else initial_nan_count:
+            logger.warning(f"Creating rolling features introduced new NaN values")
     
+    # For load ratio and load difference features, we need to ensure no NaN values in input columns
+    required_load_columns = []
+    if include_load_ratio or include_load_diff:
+        required_load_columns = ['HUFL', 'HULL', 'MUFL', 'MULL', 'LUFL', 'LULL']
+        available_load_columns = [col for col in required_load_columns if col in result_df.columns]
+        
+        if len(available_load_columns) < len(required_load_columns):
+            missing_cols = set(required_load_columns) - set(available_load_columns)
+            logger.warning(f"Missing load columns for ratio/difference features: {missing_cols}")
+            logger.info(f"Will only use available columns: {available_load_columns}")
+        
+        # Check for NaN values in load columns
+        load_nans = result_df[available_load_columns].isnull().sum()
+        load_cols_with_nans = load_nans[load_nans > 0]
+        
+        if not load_cols_with_nans.empty:
+            logger.warning(f"Load columns contain NaN values: \n{load_cols_with_nans}")
+            logger.info("Filling NaN values in load columns before creating ratio/difference features")
+            
+            for col in load_cols_with_nans.index:
+                # Similar approach to previous columns
+                result_df[col] = result_df[col].ffill(limit=12)
+                
+                if result_df[col].isnull().sum() > 0:
+                    result_df[col] = result_df[col].interpolate(method='time')
+                
+                if result_df[col].isnull().sum() > 0:
+                    result_df[col] = result_df[col].bfill(limit=12)
+                
+                if result_df[col].isnull().sum() > 0:
+                    if result_df[col].notnull().sum() > 0:
+                        fill_value = result_df[col].median()
+                        result_df[col] = result_df[col].fillna(fill_value)
+                        logger.info(f"Filled remaining NaNs in column '{col}' with median: {fill_value}")
+                    else:
+                        logger.warning(f"Column '{col}' contains all NaNs, filling with 0")
+                        result_df[col] = result_df[col].fillna(0)
+    
+    # Create load ratio features
     if include_load_ratio:
         result_df = create_load_ratio_features(result_df)
+        
+        # Check for NaNs after creating load ratio features
+        ratio_nan_count = result_df.isnull().sum().sum()
+        last_count = rolling_nan_count if include_rolling else (lag_nan_count if include_lag else initial_nan_count)
+        if ratio_nan_count > last_count:
+            logger.warning(f"Creating load ratio features introduced new NaN values")
     
+    # Create load difference features
     if include_load_diff:
         result_df = create_load_difference_features(result_df)
+        
+        # Check for NaNs after creating load difference features
+        diff_nan_count = result_df.isnull().sum().sum()
+        last_count = ratio_nan_count if include_load_ratio else (rolling_nan_count if include_rolling else (lag_nan_count if include_lag else initial_nan_count))
+        if diff_nan_count > last_count:
+            logger.warning(f"Creating load difference features introduced new NaN values")
     
+    # Create Fourier features (these shouldn't create NaNs if the index is continuous)
     if include_fourier:
         result_df = create_fourier_features(result_df, fourier_periods, fourier_order)
-    
-    # Handle missing values created during feature engineering
-    # Forward fill small gaps (up to 12 time steps) - FIXED: copy method to avoid chained assignment
-    result_df = result_df.ffill(limit=12)
-    
-    # If there are still missing values, use time interpolation
-    if result_df.isnull().sum().sum() > 0:
-        logger.info("Using time interpolation for remaining missing values")
-        result_df = result_df.interpolate(method='time')
         
-        # For any remaining missing values at the beginning, use backward fill
-        if result_df.isnull().sum().sum() > 0:
-            result_df = result_df.bfill()
-            logger.info("Used backward fill for missing values at beginning of time series")
+        # Check for NaNs after creating Fourier features
+        fourier_nan_count = result_df.isnull().sum().sum()
+        last_count = diff_nan_count if include_load_diff else (ratio_nan_count if include_load_ratio else (rolling_nan_count if include_rolling else (lag_nan_count if include_lag else initial_nan_count)))
+        if fourier_nan_count > last_count:
+            logger.warning(f"Creating Fourier features introduced new NaN values")
+    
+    # Handle missing values created during feature engineering with more advanced approach
+    nan_count_before_final = result_df.isnull().sum().sum()
+    if nan_count_before_final > 0:
+        logger.info(f"Handling {nan_count_before_final} NaN values created during feature engineering")
+        
+        # First identify columns with NaN values
+        columns_with_nans = result_df.columns[result_df.isnull().any()]
+        logger.info(f"Found {len(columns_with_nans)} columns with NaN values")
+        
+        for col in columns_with_nans:
+            nan_count_col = result_df[col].isnull().sum()
+            
+            # If only a small percentage of values are NaN, we can use more aggressive filling
+            nan_percentage = nan_count_col / len(result_df) * 100
+            
+            if nan_percentage < 5:  # Less than 5% NaN values
+                logger.info(f"Column '{col}' has {nan_percentage:.2f}% NaN values, applying aggressive filling")
+                
+                # Forward fill with larger limit
+                result_df[col] = result_df[col].ffill(limit=24)
+                
+                # Then backward fill with larger limit
+                if result_df[col].isnull().sum() > 0:
+                    result_df[col] = result_df[col].bfill(limit=24)
+                
+                # If still have NaNs, use median/mean
+                if result_df[col].isnull().sum() > 0:
+                    if result_df[col].notnull().sum() > 0:
+                        fill_value = result_df[col].median()
+                        result_df[col] = result_df[col].fillna(fill_value)
+                        logger.info(f"Filled remaining NaNs in column '{col}' with median: {fill_value}")
+            else:
+                # For columns with higher percentage of NaNs, be more careful
+                logger.info(f"Column '{col}' has {nan_percentage:.2f}% NaN values, applying careful filling")
+                
+                # First try forward fill with a limit
+                result_df[col] = result_df[col].ffill(limit=12)
+                
+                # Then use interpolation for remaining NaNs, but only for small gaps
+                if result_df[col].isnull().sum() > 0:
+                    # Find runs of NaNs
+                    mask = result_df[col].isnull()
+                    runs = mask.ne(mask.shift()).cumsum()
+                    run_sizes = mask.groupby(runs).sum()
+                    
+                    # Find runs that are too large to interpolate
+                    large_gaps = run_sizes[run_sizes > max_gap_limit].index
+                    
+                    if not large_gaps.empty:
+                        logger.warning(f"Column '{col}' has {len(large_gaps)} gaps larger than {max_gap_limit} time steps")
+                        # Only interpolate small gaps
+                        temp_series = result_df[col].copy()
+                        temp_series = temp_series.interpolate(method='time')
+                        small_gap_mask = mask & ~runs.isin(large_gaps)
+                        result_df.loc[small_gap_mask, col] = temp_series.loc[small_gap_mask]
+                    else:
+                        # No large gaps, just interpolate
+                        result_df[col] = result_df[col].interpolate(method='time')
+                
+                # For any remaining missing values, use backward fill with limit
+                if result_df[col].isnull().sum() > 0:
+                    result_df[col] = result_df[col].bfill(limit=12)
+        
+        # If there are still missing values, report them
+        nan_count_after = result_df.isnull().sum().sum()
+        if nan_count_after > 0:
+            logger.warning(f"After handling, still have {nan_count_after} NaN values")
+            missing_by_col = result_df.isnull().sum()
+            cols_with_missing = missing_by_col[missing_by_col > 0]
+            logger.warning(f"Columns with remaining missing values: \n{cols_with_missing}")
+            
+            # For remaining NaNs in features, as a last resort, fill with median or 0
+            for col in cols_with_missing.index:
+                if result_df[col].notnull().sum() > 0:
+                    fill_value = result_df[col].median()
+                    result_df[col] = result_df[col].fillna(fill_value)
+                    logger.info(f"Last resort: Filled remaining NaNs in column '{col}' with median: {fill_value}")
+                else:
+                    logger.warning(f"Column '{col}' contains all NaNs, filling with 0")
+                    result_df[col] = result_df[col].fillna(0)
+    
+    # Final check
+    final_nan_count = result_df.isnull().sum().sum()
+    if final_nan_count > 0:
+        logger.warning(f"Feature engineering complete but still have {final_nan_count} NaN values")
+        missing_by_col = result_df.isnull().sum()
+        cols_with_missing = missing_by_col[missing_by_col > 0]
+        logger.warning(f"Columns with missing values: \n{cols_with_missing}")
+    else:
+        logger.info("Feature engineering complete with no NaN values")
     
     logger.info(f"Feature set built, shape: {result_df.shape}")
     return result_df
