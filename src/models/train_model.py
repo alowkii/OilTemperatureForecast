@@ -405,9 +405,9 @@ def create_encoder_decoder_model(
         # Initialize decoder with encoder states
         decoder = decoder_inputs
         
-        # Build decoder LSTM
+        # Fix: Use decoder_units[0] * 2 to match the bidirectional encoder output size
         decoder_lstm = LSTM(
-            decoder_units[0],
+            decoder_units[0] * 2,  # Multiply by 2 to match bidirectional encoder state size
             return_sequences=True,
             return_state=True,
             recurrent_dropout=recurrent_dropout,
@@ -445,9 +445,9 @@ def create_encoder_decoder_model(
         # Define inference encoder model
         encoder_model = Model(encoder_inputs, [encoder] + encoder_states)
         
-        # Define inference decoder model
-        decoder_state_input_h = Input(shape=(decoder_units[0]*2,))
-        decoder_state_input_c = Input(shape=(decoder_units[0]*2,))
+        # Define inference decoder model - Fix: Use decoder_units[0] * 2 here too
+        decoder_state_input_h = Input(shape=(decoder_units[0] * 2,))  # Match bidirectional size
+        decoder_state_input_c = Input(shape=(decoder_units[0] * 2,))  # Match bidirectional size
         decoder_states_inputs = [decoder_state_input_h, decoder_state_input_c]
         
         decoder_outputs, state_h, state_c = decoder_lstm(
@@ -455,7 +455,7 @@ def create_encoder_decoder_model(
         )
         decoder_states = [state_h, state_c]
         
-        encoder_outputs_input = Input(shape=(input_shape[0], encoder_units[-1]*2))
+        encoder_outputs_input = Input(shape=(input_shape[0], encoder_units[-1] * 2))  # *2 for bidirectional
         context_vector = attention_layer([decoder_outputs, encoder_outputs_input])
         
         decoder_combined = Concatenate(axis=-1)([decoder_outputs, context_vector])
@@ -530,7 +530,7 @@ def create_encoder_decoder_model(
             metrics=['mae']
         )
         
-        return model  
+        return model
 class ExtremeValueLoss(tf.keras.losses.Loss):
     """
     Custom loss function that gives higher weight to errors on extreme values.
@@ -1374,7 +1374,7 @@ if __name__ == "__main__":
         X_val=X_val,
         y_val=y_val,
         batch_size=32,
-        epochs=150,
+        epochs=100,
         patience=20,
         min_delta=0.0001,
         horizon_weights=horizon_weights,
