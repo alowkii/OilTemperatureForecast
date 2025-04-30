@@ -340,7 +340,7 @@ def create_encoder_decoder_model(
     dropout_rate: float = 0.3,
     recurrent_dropout: float = 0.2,
     use_attention: bool = True
-) -> tf.keras.Model:
+) -> Union[tf.keras.Model, Tuple[tf.keras.Model, tf.keras.Model, tf.keras.Model]]:
     """
     Create an encoder-decoder architecture with optional attention mechanism.
     
@@ -363,8 +363,9 @@ def create_encoder_decoder_model(
         
     Returns
     -------
-    tf.keras.Model
-        Compiled encoder-decoder model
+    Union[tf.keras.Model, Tuple[tf.keras.Model, tf.keras.Model, tf.keras.Model]]
+        If use_attention is True: Tuple of (training model, encoder model, decoder model)
+        Otherwise: Compiled encoder-decoder model
     """
     logger.info(f"Creating encoder-decoder model with{'out' if not use_attention else ''} attention")
     
@@ -436,7 +437,7 @@ def create_encoder_decoder_model(
             decoder_combined = Dropout(dropout_rate)(decoder_combined)
         
         # Output layer
-        outputs = Dense(1, name='output_layer')(decoder_combined)
+        outputs = Dense(output_dim, name='output_layer')(decoder_combined)
         
         # Define training model (with teacher forcing)
         train_model = Model([encoder_inputs, decoder_inputs], outputs)
@@ -454,22 +455,24 @@ def create_encoder_decoder_model(
         )
         decoder_states = [state_h, state_c]
         
-        decoder_outputs = attention_layer([decoder_outputs, encoder])
-        decoder_outputs = Concatenate(axis=-1)([decoder_outputs, decoder_outputs])
-        decoder_outputs = Dropout(dropout_rate)(decoder_outputs)
+        encoder_outputs_input = Input(shape=(input_shape[0], encoder_units[-1]*2))
+        context_vector = attention_layer([decoder_outputs, encoder_outputs_input])
+        
+        decoder_combined = Concatenate(axis=-1)([decoder_outputs, context_vector])
+        decoder_combined = Dropout(dropout_rate)(decoder_combined)
         
         for i, units in enumerate(decoder_units[1:]):
-            decoder_outputs = Dense(
+            decoder_combined = Dense(
                 units,
                 activation='relu',
                 name=f'decoder_dense_{i}_inference'
-            )(decoder_outputs)
-            decoder_outputs = Dropout(dropout_rate)(decoder_outputs)
+            )(decoder_combined)
+            decoder_combined = Dropout(dropout_rate)(decoder_combined)
         
-        decoder_outputs = Dense(1, name='output_layer_inference')(decoder_outputs)
+        decoder_outputs = Dense(1, name='output_layer_inference')(decoder_combined)
         
         decoder_model = Model(
-            [decoder_inputs, encoder] + decoder_states_inputs,
+            [decoder_inputs, encoder_outputs_input] + decoder_states_inputs,
             [decoder_outputs] + decoder_states
         )
         
@@ -527,8 +530,7 @@ def create_encoder_decoder_model(
             metrics=['mae']
         )
         
-        return model
-    
+        return model  
 class ExtremeValueLoss(tf.keras.losses.Loss):
     """
     Custom loss function that gives higher weight to errors on extreme values.
@@ -586,8 +588,8 @@ def train_with_horizon_weighting(
     
     Parameters
     ----------
-    model : tf.keras.Model
-        Model to train
+    model : tf.keras.Model or Tuple
+        Model to train, or tuple of (train_model, encoder_model, decoder_model)
     X_train, y_train : np.ndarray
         Training data
     X_val, y_val : np.ndarray
@@ -606,7 +608,8 @@ def train_with_horizon_weighting(
     logger.info(f"Training model with horizon weighting")
     
     # Handle case where model is a tuple (train_model, encoder_model, decoder_model)
-    if isinstance(model, tuple):
+    is_encoder_decoder = isinstance(model, tuple)
+    if is_encoder_decoder:
         train_model = model[0]  # Extract just the training model
     else:
         train_model = model
@@ -652,56 +655,77 @@ def train_with_horizon_weighting(
         )
         callbacks.append(model_checkpoint)
     
-    # Train with custom generator (if using sample_weight_mode='temporal')
-    # Note: This requires modification to the model.fit call
-    # For simplicity, we'll use a custom loss wrapper approach instead
-    
-    class HorizonWeightedLoss(tf.keras.losses.Loss):
-        def __init__(self, base_loss, horizon_weights):
-            super().__init__(name='horizon_weighted_loss')
-            self.base_loss = base_loss
-            self.horizon_weights = tf.constant(horizon_weights, dtype=tf.float32)
+    # For encoder-decoder models with attention, we need to prepare decoder inputs
+    if is_encoder_decoder:
+        # For teacher forcing, we need to provide the target sequence as decoder input
+        # but shifted by one timestep (starts with zeros and ends without the last value)
         
-        def call(self, y_true, y_pred):
-            # Calculate base loss for each sample and horizon
-            # Shape: (batch_size, horizon)
-            per_horizon_loss = tf.square(y_true - y_pred)
+        # Create decoder inputs (shifted by one time step)
+        # For training data
+        decoder_input_train = np.zeros((len(y_train), 1, 1))  # Initial zero timestep
+        
+        # For validation data
+        decoder_input_val = np.zeros((len(y_val), 1, 1))  # Initial zero timestep
+        
+        # Train the model with the appropriate inputs
+        history = train_model.fit(
+            [X_train, decoder_input_train],  # Model expects [encoder_input, decoder_input]
+            y_train,
+            validation_data=([X_val, decoder_input_val], y_val),
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=callbacks,
+            verbose=1
+        )
+    else:
+        # For standard models, use the custom loss wrapper approach
+        # Store original loss
+        original_loss = train_model.loss
+        
+        # Create horizon-weighted wrapper
+        class HorizonWeightedLoss(tf.keras.losses.Loss):
+            def __init__(self, base_loss, horizon_weights):
+                super().__init__(name='horizon_weighted_loss')
+                self.base_loss = base_loss
+                self.horizon_weights = tf.constant(horizon_weights, dtype=tf.float32)
             
-            # Apply horizon weights
-            weighted_loss = per_horizon_loss * self.horizon_weights
-            
-            # Sum across horizons, mean across batch
-            return tf.reduce_mean(tf.reduce_sum(weighted_loss, axis=1))
-    
-    # Store original loss
-    original_loss = train_model.loss
-    
-    # Create horizon-weighted wrapper
-    weighted_loss = HorizonWeightedLoss(original_loss, horizon_weights)
-    
-    # Set model loss (temporarily)
-    train_model.compile(
-        optimizer=train_model.optimizer,
-        loss=weighted_loss,
-        metrics=train_model.metrics
-    )
-    
-    # Train the model
-    history = train_model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=epochs,
-        batch_size=batch_size,
-        callbacks=callbacks,
-        verbose=1
-    )
-    
-    # Restore original loss
-    train_model.compile(
-        optimizer=train_model.optimizer,
-        loss=original_loss,
-        metrics=train_model.metrics
-    )
+            def call(self, y_true, y_pred):
+                # Calculate base loss for each sample and horizon
+                # Shape: (batch_size, horizon)
+                per_horizon_loss = tf.square(y_true - y_pred)
+                
+                # Apply horizon weights
+                weighted_loss = per_horizon_loss * self.horizon_weights
+                
+                # Sum across horizons, mean across batch
+                return tf.reduce_mean(tf.reduce_sum(weighted_loss, axis=1))
+        
+        # Create horizon-weighted wrapper
+        weighted_loss = HorizonWeightedLoss(original_loss, horizon_weights)
+        
+        # Set model loss (temporarily)
+        train_model.compile(
+            optimizer=train_model.optimizer,
+            loss=weighted_loss,
+            metrics=train_model.metrics
+        )
+        
+        # Train the model
+        history = train_model.fit(
+            X_train, y_train,
+            validation_data=(X_val, y_val),
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=callbacks,
+            verbose=1
+        )
+        
+        # Restore original loss
+        train_model.compile(
+            optimizer=train_model.optimizer,
+            loss=original_loss,
+            metrics=train_model.metrics
+        )
     
     # Get training information
     epochs_completed = len(history.history['loss'])
