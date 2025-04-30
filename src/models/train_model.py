@@ -21,7 +21,7 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"  # Disable oneDNN optimizations for re
 
 import tensorflow as tf
 from tensorflow.keras.models import Sequential, Model, load_model
-from tensorflow.keras.layers import Dense, LSTM, Dropout, Attention, Bidirectional, Input, Concatenate, Flatten
+from tensorflow.keras.layers import Dense, LSTM, Dropout, Attention, Bidirectional, Input, Concatenate, Flatten, BatchNormalization
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
 from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler
@@ -332,6 +332,40 @@ def create_sequences(
     
     return np.array(X_sequences), np.array(y_sequences), feature_columns
 
+# Add the custom loss function definition
+def temporal_weighted_mse():
+    """
+    Custom loss function that places higher importance on certain time steps.
+    """
+    def loss_fn(y_true, y_pred):
+        # Calculate squared error
+        squared_error = tf.square(y_true - y_pred)
+        
+        # Set weights for different time steps in the prediction horizon
+        # Higher weights for early predictions (first 6 hours) and day boundaries
+        weights = tf.ones_like(y_true)
+        
+        # Emphasize first 6 steps (critical short-term forecast)
+        weights = tf.tensor_scatter_nd_update(
+            weights,
+            indices=tf.constant([[i, j] for i in range(tf.shape(y_true)[0]) for j in range(6)]),
+            updates=tf.constant([1.5] * (tf.shape(y_true)[0] * 6))
+        )
+        
+        # Emphasize day boundaries (hours 23-24)
+        if tf.shape(y_true)[1] >= 24:
+            weights = tf.tensor_scatter_nd_update(
+                weights,
+                indices=tf.constant([[i, j] for i in range(tf.shape(y_true)[0]) for j in range(22, 24)]),
+                updates=tf.constant([1.3] * (tf.shape(y_true)[0] * 2))
+            )
+        
+        # Apply weights and calculate mean
+        weighted_squared_error = squared_error * weights
+        return tf.reduce_mean(weighted_squared_error)
+    
+    return loss_fn
+
 def create_encoder_decoder_model(
     input_shape: Tuple[int, int],
     output_dim: int,
@@ -392,6 +426,8 @@ def create_encoder_decoder_model(
         else:
             encoder, forward_h, forward_c, backward_h, backward_c = lstm_layer(encoder)
         
+        encoder = BatchNormalization(name=f'encoder_bn_{i}')(encoder)
+
         # Concatenate forward and backward states
         state_h = Concatenate()([forward_h, backward_h])
         state_c = Concatenate()([forward_c, backward_c])
@@ -416,7 +452,8 @@ def create_encoder_decoder_model(
         
         # Initial decoder state is the encoder final state
         decoder_outputs, _, _ = decoder_lstm(decoder, initial_state=encoder_states)
-        
+        decoder_outputs = BatchNormalization(name='decoder_bn')(decoder_outputs)
+
         # Apply attention
         attention_layer = Attention(name='attention_layer')
         context_vector = attention_layer([decoder_outputs, encoder])
@@ -638,8 +675,8 @@ def train_with_horizon_weighting(
     # Learning rate reduction
     reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
         monitor='val_loss',
-        factor=0.5,
-        patience=patience // 2,
+        factor=0.3,
+        patience=3,
         min_lr=1e-6,
         verbose=1
     )
@@ -703,11 +740,11 @@ def train_with_horizon_weighting(
         # Create horizon-weighted wrapper
         weighted_loss = HorizonWeightedLoss(original_loss, horizon_weights)
         
-        # Set model loss (temporarily)
+        # Set model loss to the custom loss
         train_model.compile(
-            optimizer=train_model.optimizer,
-            loss=weighted_loss,
-            metrics=train_model.metrics
+            optimizer=Adam(learning_rate=0.001, clipnorm=1.0),
+            loss=temporal_weighted_mse(),
+            metrics=['mae']
         )
         
         # Train the model
@@ -820,11 +857,13 @@ def split_train_val(
     X: np.ndarray,
     y: np.ndarray,
     val_size: float = 0.2,
-    shuffle: bool = False,
-    random_state: Optional[int] = None
+    shuffle: bool = False,  # Set default to False
+    random_state: Optional[int] = None,
+    timestamps: Optional[np.ndarray] = None  # Add timestamps parameter
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Split sequences into training and validation sets.
+    Prioritizes time-based splitting for time series data.
     
     Parameters
     ----------
@@ -836,9 +875,10 @@ def split_train_val(
         Fraction of data to use for validation, by default 0.2
     shuffle : bool, optional
         Whether to shuffle data before splitting, by default False
-        (For time series, shuffling is usually not recommended)
     random_state : int, optional
         Random state for reproducibility if shuffling, by default None
+    timestamps : np.ndarray, optional
+        Timestamps for sequences, by default None
         
     Returns
     -------
@@ -847,6 +887,13 @@ def split_train_val(
     """
     # For time series, we typically split sequentially
     if not shuffle:
+        if timestamps is not None:
+            # If timestamps are provided, sort by time first
+            logger.info("Performing time-based split with timestamps")
+            sorted_indices = np.argsort(timestamps)
+            X = X[sorted_indices]
+            y = y[sorted_indices]
+        
         split_idx = int(len(X) * (1 - val_size))
         X_train, X_val = X[:split_idx], X[split_idx:]
         y_train, y_val = y[:split_idx], y[split_idx:]
@@ -1350,15 +1397,24 @@ if __name__ == "__main__":
     
     # Split into train and validation sets
     X_train, X_val, y_train, y_val = split_train_val(X, y, val_size=0.2)
+
+    train_extreme_count = np.sum(np.any(y_train >= extreme_threshold, axis=1))
+    val_extreme_count = np.sum(np.any(y_val >= extreme_threshold, axis=1))
+    train_extreme_pct = (train_extreme_count / len(y_train)) * 100
+    val_extreme_pct = (val_extreme_count / len(y_val)) * 100
+    print(f"Extreme temps in training: {train_extreme_pct:.2f}% ({train_extreme_count} sequences)")
+    print(f"Extreme temps in validation: {val_extreme_pct:.2f}% ({val_extreme_count} sequences)")
+    if abs(train_extreme_pct - val_extreme_pct) > 5.0:
+        print(f"WARNING: Large difference in extreme temperature distribution between train and validation sets!")
     
     # Create encoder-decoder model
     model_result = create_encoder_decoder_model(
         input_shape=(X.shape[1], X.shape[2]),
         output_dim=forecast_horizon,
-        encoder_units=[128, 128],
-        decoder_units=[128, 96, 64],
-        dropout_rate=0.3,
-        recurrent_dropout=0.2,
+        encoder_units=[196, 128],
+        decoder_units=[128, 96, 64, 32],
+        dropout_rate=0.25, # disabled dropout for simplicity
+        recurrent_dropout=0.15,
         use_attention=True
     )
     
@@ -1373,9 +1429,9 @@ if __name__ == "__main__":
         y_train=y_train,
         X_val=X_val,
         y_val=y_val,
-        batch_size=32,
+        batch_size=64,
         epochs=100,
-        patience=20,
+        patience=25,
         min_delta=0.0001,
         horizon_weights=horizon_weights,
         model_path=str(model_path)
