@@ -96,5 +96,21 @@ python -m src.models.predict
 ### Run:
 
 ```bash
-python -m src.visualization.visualize_results
+python -m src.visualization.visualize
+```
+
+## 9. Run all steps in order:
+
+### Run:
+
+```bash
+pip install -e .
+pip install .
+pip install '.[dev]' # to install development dependencies
+python setup.py sdist bdist_wheel # to create a source distribution and a wheel distribution
+python setup.py install # to install the package
+
+# for build
+pip install build
+python -m build
 ```
