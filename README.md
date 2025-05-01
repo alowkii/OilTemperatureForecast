@@ -16,7 +16,7 @@ Electrical transformers are critical infrastructure components that require care
 - Special handling for extreme temperature events
 - Comprehensive evaluation framework
 
-For detailed technical information, please see the [full documentation](./documentation.md).
+For detailed technical information, please see the [full documentation](./Documentation.md).
 
 ## Folders Structure
 
