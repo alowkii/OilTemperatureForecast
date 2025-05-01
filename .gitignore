@@ -1,7 +1,6 @@
 /Env
 /Env_py312
 /Data
-/models/
 /__pycache__
 __pycache__/
 /OilTemperatureForecast.egg-info
