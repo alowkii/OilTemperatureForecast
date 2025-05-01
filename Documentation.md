@@ -26,7 +26,7 @@ OilTemperatureForecast/
 │   └── data_exploration.ipynb - For exploration data analysis
 ├── reports/             - Results and visualisations
 │   ├── figures/         - Generated image outputs
-│   ├── dashboard.html   - Interactive web dashboard
+│   ├── dashboard.html   - Simple web dashboard
 │   ├── extreme_cases_analysis.json
 │   └── model_evaluation.json
 ├── src/                 - All source code
@@ -85,11 +85,12 @@ processed_df.loc[small_gap_mask, col] = temp_series.loc[small_gap_mask]
 The developer implemented IQR-based methods with different thresholds for different variables:
 
 1. **Oil Temperature (OT)**:
-   - More permissive thresholds: Q1 - 3.0 * IQR to Q3 + 3.0 * IQR
+
+   - More permissive thresholds: Q1 - 3.0 _ IQR to Q3 + 3.0 _ IQR
    - Values outside these bounds are capped rather than replaced to keep extreme patterns
 
 2. **Other Variables**:
-   - Standard thresholds: Q1 - 2.5 * IQR to Q3 + 2.5 * IQR
+   - Standard thresholds: Q1 - 2.5 _ IQR to Q3 + 2.5 _ IQR
    - Outliers get replaced with the column median
 
 ```python
@@ -115,6 +116,7 @@ The feature engineering module (`src/features/build_features.py`) creates many t
 ### Key Feature Types
 
 #### Temporal Dependencies
+
 ```python
 # Creating lag features to capture autocorrelation
 for col in columns:
@@ -126,11 +128,12 @@ for col in columns:
 **Rationale**: Oil temperature shows strong autocorrelation patterns. The lag features for 1, 2, 3, 6, 12, 24, and 48 hours helps the model learn from recent history and seeing daily patterns.
 
 #### Rolling Window Statistics
+
 ```python
 # Statistical values over different time windows
 for window in windows:
     rolling = df_with_rolling[col].rolling(window=window, min_periods=1)
-    
+
     for func_name, func in functions.items():
         feature_name = f"{col}_rolling_{window}_{func_name}"
         df_with_rolling[feature_name] = rolling.apply(func, raw=True)
@@ -139,6 +142,7 @@ for window in windows:
 **Rationale**: Rolling statistics (mean, std, min, max) give information about recent trends, volatility, and extremes, that helps the model understand current value context.
 
 #### Seasonality Modeling
+
 ```python
 # Fourier features for capturing multiple seasonal patterns
 for k in range(1, order + 1):
@@ -149,6 +153,7 @@ for k in range(1, order + 1):
 **Rationale**: Transformers have daily (24-hour), weekly (168-hour), and yearly (8760-hour) patterns. These Fourier features efficiently capture cyclical behaviors without needing years of data.
 
 #### Load Relationship Features
+
 ```python
 # Creating ratios between useful and useless loads
 df_with_ratios['load_efficiency'] = (
@@ -159,6 +164,7 @@ df_with_ratios['load_efficiency'] = (
 **Rationale**: The ratio between useful and useless loads acts as key indicator of transformer efficiency. These features help model understand how different load distributions affect temperature.
 
 #### Temperature Rate Features
+
 ```python
 # Rate of change in temperature over time
 df_with_rates[f'{temperature_column}_roc_{window}'] = df[temperature_column].diff(window) / window
@@ -167,6 +173,7 @@ df_with_rates[f'{temperature_column}_roc_{window}'] = df[temperature_column].dif
 **Rationale**: The rate of temperature change is critical for predicting fast heating or cooling events. These features captures acceleration and deceleration patterns in oil temperature.
 
 #### Extreme Temperature Features
+
 ```python
 # Binary indicator of extreme temperatures
 new_features[f'{temperature_column}_extreme'] = (df[temperature_column] >= threshold).astype(int)
@@ -242,6 +249,7 @@ These insights directly informed the feature engineering approach, especially th
 The project implements an encoder-decoder LSTM architecture with attention mechanism, designed specifically for multi-step forecasting task (24-hour prediction horizon).
 
 #### Encoder Component
+
 ```python
 # Bidirectional LSTM layers for encoder
 lstm_layer = Bidirectional(
@@ -258,6 +266,7 @@ lstm_layer = Bidirectional(
 The encoder processes input sequence (24 hours of historical data) using bidirectional LSTM layers to capture patterns from both past and future context.
 
 #### Attention Mechanism
+
 ```python
 # Apply attention between encoder and decoder
 attention_layer = Attention(name='attention_layer')
@@ -267,6 +276,7 @@ context_vector = attention_layer([decoder_outputs, encoder])
 The attention mechanism allows model to focus on most relevant parts of input sequence when making predictions, particularly useful for identifying patterns that come before temperature spikes.
 
 #### Decoder Component
+
 ```python
 # Decoder using LSTM and dense layers
 decoder_lstm = LSTM(
@@ -281,16 +291,17 @@ decoder_lstm = LSTM(
 The decoder generates output sequence (24-hour forecast) using LSTM layers and dense connections, with context vector from attention mechanism providing additional information.
 
 #### Custom Loss Function
+
 ```python
 def temporal_weighted_mse():
     def loss_fn(y_true, y_pred):
         # Calculate squared error first
         squared_error = tf.square(y_true - y_pred)
-        
+
         # Setting weights for different time steps in prediction horizon
         # Higher weights for early predictions and day boundaries
         weights = tf.ones_like(y_true)
-        
+
         # Emphasizing first 6 steps (critical short-term forecast)
         weights = tf.tensor_scatter_nd_update(
             weights,
@@ -300,12 +311,14 @@ def temporal_weighted_mse():
 ```
 
 A custom loss function was implemented to place higher importance on:
+
 1. Near-term predictions (first 6 hours), which are more actionable for operators
 2. Day boundary predictions (hours 23-24), which are critical for planning next day activities
 
 ### Model Training
 
 The model training process included:
+
 - Sequence creation with balanced representation of extreme values
 - Early stopping and learning rate reduction to prevent overfitting
 - Horizon weighting to prioritize accuracy of earlier predictions
@@ -321,47 +334,47 @@ The model was evaluated using multiple metrics to understand its performance acr
 
 From `reports/model_evaluation.json`:
 
-| Metric | Value |
-|--------|-------|
-| MAE    | 13.27 |
-| RMSE   | 14.67 |
+| Metric | Value  |
+| ------ | ------ |
+| MAE    | 13.27  |
+| RMSE   | 14.67  |
 | MAPE   | 34.25% |
-| R²     | -4.43 |
+| R²     | -4.43  |
 
 #### Performance by Forecast Horizon
 
 The model shows increasing error with longer forecast horizons:
 
-| Horizon (hours) | MAE   | RMSE  | MAPE   |
-|-----------------|-------|-------|--------|
-| 0 (1-hour ahead)| 12.98 | 14.16 | 33.93% |
-| 6               | 13.25 | 14.59 | 34.28% |
-| 12              | 13.48 | 14.89 | 34.68% |
-| 18              | 13.28 | 14.79 | 34.14% |
-| 23 (24-hour ahead)| 13.45 | 15.06 | 34.44% |
+| Horizon (hours)    | MAE   | RMSE  | MAPE   |
+| ------------------ | ----- | ----- | ------ |
+| 0 (1-hour ahead)   | 12.98 | 14.16 | 33.93% |
+| 6                  | 13.25 | 14.59 | 34.28% |
+| 12                 | 13.48 | 14.89 | 34.68% |
+| 18                 | 13.28 | 14.79 | 34.14% |
+| 23 (24-hour ahead) | 13.45 | 15.06 | 34.44% |
 
 #### Performance by Time of Day
 
 Error rates vary significantly depending on hour of day:
 
-| Hour | MAE   | RMSE  | MAPE   |
-|------|-------|-------|--------|
-| 4 AM | 10.20 | 10.94 | 29.42% |
-| 12 PM| 15.91 | 17.06 | 38.70% |
-| 3 PM | 17.84 | 19.31 | 40.93% |
-| 8 PM | 15.86 | 17.35 | 37.91% |
+| Hour  | MAE   | RMSE  | MAPE   |
+| ----- | ----- | ----- | ------ |
+| 4 AM  | 10.20 | 10.94 | 29.42% |
+| 12 PM | 15.91 | 17.06 | 38.70% |
+| 3 PM  | 17.84 | 19.31 | 40.93% |
+| 8 PM  | 15.86 | 17.35 | 37.91% |
 
 #### Extreme Temperature Performance
 
 From `reports/extreme_cases_analysis.json`:
 
-| Metric | Value |
-|--------|-------|
-| Mean Error | 24.11 |
-| Mean Abs Error | 24.11 |
-| Mean Pct Error | 49.83% |
-| RMSE  | 24.28 |
-| R²    | -328.66 |
+| Metric         | Value   |
+| -------------- | ------- |
+| Mean Error     | 24.11   |
+| Mean Abs Error | 24.11   |
+| Mean Pct Error | 49.83%  |
+| RMSE           | 24.28   |
+| R²             | -328.66 |
 
 ### Analysis of Model Strengths and Weaknesses
 
@@ -386,19 +399,23 @@ From `reports/extreme_cases_analysis.json`:
 ### Potential Improvements
 
 1. **Model Architecture Refinements**:
+
    - Implement ensemble methods combining predictions from specialized models
    - Develop dedicated model for extreme temperature events
    - Consider simpler models alongside complex ones to improve baseline performance
 
 2. **Loss Function Enhancements**:
+
    - Implement asymmetric loss functions that penalize under-prediction of high temperatures more severely
    - Develop quantile regression for better uncertainty estimation
 
 3. **Feature Selection and Engineering**:
+
    - Perform feature importance analysis to identify and focus on most predictive features
    - Engineer additional features specifically targeting extreme temperature patterns
 
 4. **Data Augmentation**:
+
    - Generate synthetic samples for extreme temperature scenarios
    - Apply time series specific augmentation techniques to increase prevalence of extreme events in training
 
@@ -411,6 +428,7 @@ From `reports/extreme_cases_analysis.json`:
 ### Environment Setup
 
 1. Create Python 3.12.10 virtual environment:
+
    ```bash
    python -m venv Env_py312
    source Env_py312/bin/activate  # Linux/Mac
@@ -425,26 +443,31 @@ From `reports/extreme_cases_analysis.json`:
 ### Running the Pipeline
 
 1. Preprocess data:
+
    ```bash
    python -m src.data.make_dataset
    ```
 
 2. Extract features:
+
    ```bash
    python -m src.features.build_features
    ```
 
 3. Train model:
+
    ```bash
    python -m src.models.train_model
    ```
 
 4. Evaluate model:
+
    ```bash
    python -m src.models.evaluate_model
    ```
 
 5. Make predictions:
+
    ```bash
    python -m src.models.predict
    ```
@@ -455,6 +478,7 @@ From `reports/extreme_cases_analysis.json`:
    ```
 
 Alternatively, install package to run all components:
+
 ```bash
 pip install -e .
 ```
