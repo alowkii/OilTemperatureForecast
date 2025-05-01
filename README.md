@@ -68,3 +68,33 @@ python -m src.data.make_dataset
 ```bash
 python -m src.features.build_features
 ```
+
+## 5. Train models:
+
+### Run:
+
+```bash
+python -m src.models.train_model
+```
+
+## 6. Evaluate models:
+
+### Run:
+
+```bash
+python -m src.models.evaluate_model
+```
+
+## 7. Make predictions on test set:
+
+```bash
+python -m src.models.predict
+```
+
+## 8. Visualize results:
+
+### Run:
+
+```bash
+python -m src.visualization.visualize_results
+```

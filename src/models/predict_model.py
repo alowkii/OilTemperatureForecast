@@ -71,6 +71,79 @@ def load_model(
     
     return model, scaler, history
 
+def create_basic_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create basic features that might be needed for prediction but are missing.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input DataFrame with datetime index
+        
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with additional basic features
+    """
+    logger.info("Creating basic features for missing columns")
+    
+    # Make a copy to avoid modifying the original
+    df_new = df.copy()
+    
+    # Dictionary to store new features
+    new_features = {}
+    
+    # Create lag features of OT if OT exists but lag features don't
+    if 'OT' in df_new.columns:
+        for lag in [1, 2, 3, 6, 12, 24, 48]:
+            lag_col = f'OT_lag_{lag}'
+            if lag_col not in df_new.columns:
+                new_features[lag_col] = df_new['OT'].shift(lag)
+    
+    # Create lag features for main load columns if they exist
+    for col in ['HUFL', 'MUFL', 'LUFL']:
+        if col in df_new.columns:
+            for lag in [1, 24, 48]:
+                lag_col = f'{col}_lag_{lag}'
+                if lag_col not in df_new.columns:
+                    new_features[lag_col] = df_new[col].shift(lag)
+    
+    # Create basic time features
+    if isinstance(df_new.index, pd.DatetimeIndex):
+        # Hour of day
+        hour = df_new.index.hour
+        
+        # Day of week
+        day_of_week = df_new.index.dayofweek
+        
+        # Month
+        month = df_new.index.month
+        
+        # Basic cyclical encoding for time
+        if 'daily_sin_1' not in df_new.columns:
+            new_features['daily_sin_1'] = np.sin(2 * np.pi * hour / 24)
+            new_features['daily_cos_1'] = np.cos(2 * np.pi * hour / 24)
+        
+        if 'weekly_sin_1' not in df_new.columns:
+            new_features['weekly_sin_1'] = np.sin(2 * np.pi * day_of_week / 7)
+            new_features['weekly_cos_1'] = np.cos(2 * np.pi * day_of_week / 7)
+        
+        if 'yearly_sin_1' not in df_new.columns:
+            new_features['yearly_sin_1'] = np.sin(2 * np.pi * month / 12)
+            new_features['yearly_cos_1'] = np.cos(2 * np.pi * month / 12)
+    
+    # Create DataFrame with new features
+    if new_features:
+        new_features_df = pd.DataFrame(new_features, index=df_new.index)
+        
+        # Concatenate with original data
+        result = pd.concat([df_new, new_features_df], axis=1)
+        
+        logger.info(f"Created {len(new_features)} basic features")
+        return result
+    
+    return df_new
+
 def prepare_data_for_prediction(
     df: pd.DataFrame,
     sequence_length: int,
@@ -110,6 +183,23 @@ def prepare_data_for_prediction(
     # Ensure data is sorted by index
     data = data.sort_index()
     
+    # Check for required feature columns
+    available_columns = data.columns.tolist()
+    missing_columns = [col for col in feature_columns if col not in available_columns]
+    
+    if missing_columns:
+        logger.warning(f"Missing {len(missing_columns)} feature columns required by the model")
+        logger.warning(f"First few missing features: {missing_columns[:5]}")
+        
+        # Check if we should use available features only or attempt to create missing features
+        # For this fix, we'll use only available features
+        feature_columns = [col for col in feature_columns if col in available_columns]
+        
+        if not feature_columns:
+            raise ValueError("No required features are available in the dataset")
+        
+        logger.info(f"Proceeding with {len(feature_columns)} available features")
+    
     # Check for NaN values in feature columns
     nan_count = data[feature_columns].isna().sum().sum()
     if nan_count > 0:
@@ -136,14 +226,38 @@ def prepare_data_for_prediction(
     # Scale data if scaler is provided
     if scaler:
         logger.info("Scaling data")
-        scaled_values = scaler.transform(data)
-        data = pd.DataFrame(scaled_values, index=data.index, columns=data.columns)
+        
+        # Check if all columns required by scaler are present
+        if hasattr(scaler, 'feature_names_in_'):
+            scaler_columns = scaler.feature_names_in_
+            
+            # If we have column name information in the scaler
+            columns_for_scaling = [col for col in scaler_columns if col in data.columns]
+            
+            if len(columns_for_scaling) < len(scaler_columns):
+                logger.warning(f"Missing {len(scaler_columns) - len(columns_for_scaling)} columns required by scaler")
+                # Create dummy columns with zeros for missing features
+                missing_scaler_cols = [col for col in scaler_columns if col not in data.columns]
+                missing_df = pd.DataFrame(0.0, index=data.index, columns=missing_scaler_cols)
+                
+                # Concatenate with original data
+                data = pd.concat([data, missing_df], axis=1)
+                logger.info(f"Created {len(missing_scaler_cols)} dummy columns for scaling")
+            
+            # Now scale with all required columns
+            scaled_values = scaler.transform(data[scaler_columns])
+            # Create a new DataFrame with scaled values
+            scaled_df = pd.DataFrame(scaled_values, index=data.index, columns=scaler_columns)
+            # Replace only the columns we need for prediction
+            for col in feature_columns:
+                if col in scaled_df.columns:
+                    data[col] = scaled_df[col]
+        else:
+            # No column information, try standard scaling
+            scaled_values = scaler.transform(data)
+            data = pd.DataFrame(scaled_values, index=data.index, columns=data.columns)
     
     # Extract feature columns
-    if not all(col in data.columns for col in feature_columns):
-        missing_cols = [col for col in feature_columns if col not in data.columns]
-        raise ValueError(f"Missing feature columns: {missing_cols}")
-    
     X_values = data[feature_columns].values
     
     # Create sequences
@@ -202,31 +316,64 @@ def make_predictions(
     """
     logger.info(f"Making predictions for {len(X)} sequences")
     
-    # Make predictions
-    predictions = model.predict(X)
+    # Check if the model requires two inputs (encoder-decoder with attention)
+    if isinstance(model.input, list) and len(model.input) == 2:
+        logger.info("Detected encoder-decoder model with two inputs (encoder + decoder)")
+        
+        # For encoder-decoder models with attention, we need to provide the decoder input
+        # Create a dummy decoder input with zeros (for inference)
+        decoder_input = np.zeros((len(X), 1, 1))
+        
+        # Make predictions
+        predictions = model.predict([X, decoder_input])
+    else:
+        # For single-input models
+        predictions = model.predict(X)
     
     # Denormalize predictions if scaler is provided
     if scaler and target_column_idx is not None:
         logger.info("Denormalizing predictions")
         
-        # Create a dummy array with correct shape for inverse_transform
-        # We'll only replace the target column with our predictions
-        dummy = np.zeros((len(predictions), scaler.n_features_in_))
+        # Get prediction shape and handle different model output formats
+        pred_shape = predictions.shape
+        logger.info(f"Raw prediction shape: {pred_shape}")
         
-        # For each prediction (which can be multi-step)
-        denormalized_predictions = np.zeros_like(predictions)
+        # Handle the specific shape (samples, 1, time_steps) from encoder-decoder
+        if len(pred_shape) == 3:
+            if pred_shape[1] == 1 and pred_shape[2] > 1:
+                # Shape is (samples, 1, time_steps) - need to reshape to (samples, time_steps)
+                logger.info(f"Reshaping from {pred_shape} to (samples, time_steps)")
+                predictions = predictions.squeeze(axis=1)
+                logger.info(f"New shape after squeeze: {predictions.shape}")
+            elif pred_shape[2] == 1 and pred_shape[1] > 1:
+                # Shape is (samples, time_steps, 1) - need to reshape to (samples, time_steps)
+                logger.info(f"Reshaping from {pred_shape} to (samples, time_steps)")
+                predictions = predictions.squeeze(axis=2)
+                logger.info(f"New shape after squeeze: {predictions.shape}")
         
-        for i in range(predictions.shape[1]):  # For each step in the forecast horizon
-            # Replace the target column with the predictions for this step
-            dummy_step = dummy.copy()
-            dummy_step[:, target_column_idx] = predictions[:, i]
-            
-            # Inverse transform
-            denorm_step = scaler.inverse_transform(dummy_step)
-            
-            # Extract just the target column
-            denormalized_predictions[:, i] = denorm_step[:, target_column_idx]
+        # Now proceed with denormalization
+        n_samples = predictions.shape[0]
+        n_steps = predictions.shape[1]
         
+        logger.info(f"Denormalizing {n_samples} samples with {n_steps} steps each")
+        
+        # Create empty array for denormalized predictions
+        denormalized_predictions = np.zeros((n_samples, n_steps))
+        
+        # Process each sample and step individually to avoid broadcasting issues
+        for i in range(n_samples):
+            for j in range(n_steps):
+                # Create a dummy array with all zeros except for the target value
+                dummy = np.zeros(scaler.n_features_in_)
+                dummy[target_column_idx] = predictions[i, j]
+                
+                # Inverse transform this single point
+                denorm_point = scaler.inverse_transform(dummy.reshape(1, -1))
+                
+                # Store the denormalized value
+                denormalized_predictions[i, j] = denorm_point[0, target_column_idx]
+        
+        logger.info(f"Denormalized predictions shape: {denormalized_predictions.shape}")
         return denormalized_predictions
     
     # If no scaler or target_column_idx provided, return raw predictions
@@ -275,21 +422,44 @@ def forecast_future(
     # Store predictions
     predictions = np.zeros((1, forecast_horizon))
     
+    # Check if the model requires two inputs (encoder-decoder with attention)
+    is_encoder_decoder = isinstance(model.input, list) and len(model.input) == 2
+    
     for i in range(forecast_horizon):
         # Predict the next step
-        next_pred = model.predict(sequence)
+        if is_encoder_decoder:
+            # Create dummy decoder input (single zero timestep)
+            decoder_input = np.zeros((1, 1, 1))
+            next_pred = model.predict([sequence, decoder_input])
+        else:
+            next_pred = model.predict(sequence)
         
+        # Handle different prediction shapes
+        if len(next_pred.shape) > 2:
+            # If prediction is 3D (batch, time_steps, features)
+            # Take the first time step and first feature
+            next_val = next_pred[0, 0, 0]
+        elif len(next_pred.shape) == 2:
+            # If prediction is 2D (batch, time_steps)
+            # Take the first time step
+            next_val = next_pred[0, 0]
+        else:
+            # For unusual shapes, just take the first element
+            next_val = next_pred[0]
+            
         # Store the prediction for this step
-        predictions[0, i] = next_pred[0, 0]  # Assuming single-step prediction
+        predictions[0, i] = next_val
         
         # Update sequence for next iteration by shifting and adding new prediction
         # Remove the oldest time step
         sequence = sequence[:, 1:, :]
         
-        # If we need to update more than just the target column, we'd need additional logic here
-        # This simplified version only updates the target column
+        # Create new step based on the last time step
         new_step = sequence[:, -1, :].copy()
-        new_step[0, target_column_idx] = next_pred[0, 0]
+        
+        # Update the target feature with our prediction
+        if target_column_idx is not None:
+            new_step[0, target_column_idx] = next_val
         
         # Add the new step to the sequence
         sequence = np.concatenate([sequence, new_step.reshape(1, 1, -1)], axis=1)
@@ -399,8 +569,40 @@ def predict_dataset(
     """
     logger.info(f"Predicting for dataset with {len(df)} rows")
     
-    # Handle NaNs in input data if requested
+    # Create a deep copy of the dataframe to avoid modifying the original
     data = df.copy()
+    
+    # Check for required feature columns
+    available_columns = data.columns.tolist()
+    missing_columns = [col for col in feature_columns if col not in available_columns]
+    
+    if missing_columns:
+        logger.warning(f"Missing {len(missing_columns)} feature columns required by the model")
+        logger.info(f"First few missing features: {missing_columns[:10]}")
+        
+        # Try to create basic missing features
+        data = create_basic_features(data)
+        
+        # Recheck missing columns after feature creation
+        available_columns = data.columns.tolist()
+        still_missing = [col for col in feature_columns if col not in available_columns]
+        
+        if still_missing:
+            logger.warning(f"Still missing {len(still_missing)} features after attempting to create basic features")
+            
+            # Create dummy columns with zeros for remaining missing features
+            # Instead of adding one by one (which causes DataFrame fragmentation),
+            # create a DataFrame with all missing columns and then concatenate
+            missing_df = pd.DataFrame(0.0, 
+                                     index=data.index, 
+                                     columns=still_missing)
+            
+            # Concatenate with original data
+            data = pd.concat([data, missing_df], axis=1)
+            
+            logger.info(f"Created {len(still_missing)} dummy columns filled with zeros")
+    
+    # Handle NaNs in input data if requested
     if handle_nans:
         # Check for NaN values in feature columns
         nan_count = data[feature_columns].isna().sum().sum()
@@ -423,10 +625,12 @@ def predict_dataset(
             remaining_nans = data[feature_columns].isna().sum().sum()
             if remaining_nans > 0:
                 logger.warning(f"Still have {remaining_nans} NaN values after handling")
+                # Fill remaining NaNs with 0
+                data[feature_columns] = data[feature_columns].fillna(0)
     
-    # Prepare data for prediction (passing updated handle_nans parameter)
+    # Prepare data for prediction
     X, timestamps = prepare_data_for_prediction(
-        data, sequence_length, feature_columns, scaler, handle_nans=handle_nans
+        data, sequence_length, feature_columns, scaler, handle_nans=False  # NaNs already handled
     )
     
     # Check if we have any valid sequences
@@ -435,13 +639,28 @@ def predict_dataset(
         return pd.DataFrame()
     
     # Get target column index for denormalization
+    target_idx = None
     if scaler:
-        target_idx = list(data.columns).index(target_column)
-    else:
-        target_idx = None
+        if hasattr(scaler, 'feature_names_in_'):
+            # Get index from scaler's feature names
+            scaler_columns = list(scaler.feature_names_in_)
+            if target_column in scaler_columns:
+                target_idx = scaler_columns.index(target_column)
+                logger.info(f"Found target column '{target_column}' at index {target_idx} in scaler features")
+            else:
+                logger.warning(f"Target column '{target_column}' not found in scaler's feature names")
+        else:
+            # Try to get index from dataframe columns
+            if target_column in data.columns:
+                target_idx = list(data.columns).index(target_column)
+                logger.info(f"Using target column '{target_column}' at index {target_idx} from DataFrame columns")
+            else:
+                logger.warning(f"Target column '{target_column}' not found in DataFrame")
     
     # Make predictions
+    logger.info(f"Calling make_predictions with X shape {X.shape}")
     predictions = make_predictions(model, X, scaler, target_idx)
+    logger.info(f"Received predictions with shape {predictions.shape}")
     
     # Create result DataFrame
     result_dfs = []
@@ -453,9 +672,26 @@ def predict_dataset(
             timestamp, forecast_horizon, freq
         )
         
+        # Ensure we have the right shape for each prediction row
+        # Handle case where prediction shape might have been squeezed
+        if len(predictions.shape) == 1:
+            row_prediction = predictions.reshape(1, -1)[0]
+        else:
+            row_prediction = predictions[i]
+        
+        # Ensure we're only using forecast_horizon steps even if model outputs more
+        if len(row_prediction) > forecast_horizon:
+            logger.warning(f"Model predicted {len(row_prediction)} steps, but we only requested {forecast_horizon}")
+            row_prediction = row_prediction[:forecast_horizon]
+        elif len(row_prediction) < forecast_horizon:
+            logger.warning(f"Model predicted only {len(row_prediction)} steps, but we need {forecast_horizon}")
+            # Pad with the last value if necessary
+            padding = np.full(forecast_horizon - len(row_prediction), row_prediction[-1])
+            row_prediction = np.concatenate([row_prediction, padding])
+            
         # Create DataFrame for this forecast
         forecast_df = pd.DataFrame(
-            predictions[i].reshape(forecast_horizon, 1),
+            row_prediction.reshape(forecast_horizon, 1),
             index=forecast_times,
             columns=['predicted']
         )
@@ -495,7 +731,7 @@ def predict_dataset(
     else:
         logger.warning("No predictions generated")
         return pd.DataFrame()
-    
+
 if __name__ == "__main__":
     # Example usage
     project_dir = Path(__file__).resolve().parents[2]
@@ -506,7 +742,7 @@ if __name__ == "__main__":
     # Define paths
     test_features_path = project_dir / "data" / "features" / "test_features.csv"
     model_dir = project_dir / "models"
-    model_path = model_dir / "lstm_model.keras"
+    model_path = model_dir / "lstm_encoder_decoder_model.keras"  # Updated model path
     scaler_path = model_dir / "scaler.pkl"
     predictions_path = project_dir / "data" / "predictions" / "test_predictions.csv"
     
@@ -520,13 +756,26 @@ if __name__ == "__main__":
         scaler_path=str(scaler_path)
     )
     
+    # Check if the model requires two inputs (encoder-decoder with attention)
+    is_encoder_decoder = isinstance(model.input, list) and len(model.input) == 2
+    if is_encoder_decoder:
+        print(f"Detected encoder-decoder model with attention mechanism")
+    else:
+        print(f"Detected single-input model architecture")
+    
     # Get metadata from history
     if history and 'metadata' in history:
         metadata = history['metadata']
         sequence_length = metadata.get('sequence_length', 24)
         forecast_horizon = metadata.get('forecast_horizon', 24)
         target_column = metadata.get('target_column', 'OT')
+        
+        # Check if model type is specified in metadata
+        model_type = metadata.get('model_type', None)
+        if model_type:
+            print(f"Model type from metadata: {model_type}")
     else:
+        print("No metadata found in history, using default values")
         sequence_length = 24
         forecast_horizon = 24
         target_column = 'OT'
@@ -541,7 +790,15 @@ if __name__ == "__main__":
     if feature_columns is None:
         feature_columns = [col for col in test_df.columns if col != target_column]
     
-    # Make predictions
+    # Print feature matching information
+    available_columns = test_df.columns.tolist()
+    missing_columns = [col for col in feature_columns if col not in available_columns]
+    present_columns = [col for col in feature_columns if col in available_columns]
+    
+    print(f"Model requires {len(feature_columns)} features, found {len(present_columns)} in dataset")
+    print(f"Missing {len(missing_columns)} features that will be created or filled with zeros")
+    
+    # Make predictions with enhanced feature handling
     predictions_df = predict_dataset(
         model=model,
         df=test_df,

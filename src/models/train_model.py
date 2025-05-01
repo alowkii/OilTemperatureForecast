@@ -515,7 +515,7 @@ def create_encoder_decoder_model(
         
         # Compile model
         train_model.compile(
-            optimizer=Adam(learning_rate=0.001),
+            optimizer=Adam(learning_rate=0.0005),
             loss='mse',
             metrics=['mae']
         )
@@ -562,7 +562,7 @@ def create_encoder_decoder_model(
         
         # Compile model
         model.compile(
-            optimizer=Adam(learning_rate=0.001),
+            optimizer=Adam(learning_rate=0.0005),
             loss='mse',
             metrics=['mae']
         )
@@ -742,7 +742,7 @@ def train_with_horizon_weighting(
         
         # Set model loss to the custom loss
         train_model.compile(
-            optimizer=Adam(learning_rate=0.001, clipnorm=1.0),
+            optimizer=Adam(learning_rate=0.0005, clipnorm=1.0),
             loss=temporal_weighted_mse(),
             metrics=['mae']
         )
@@ -1413,7 +1413,7 @@ if __name__ == "__main__":
         output_dim=forecast_horizon,
         encoder_units=[196, 128],
         decoder_units=[128, 96, 64, 32],
-        dropout_rate=0.25, # disabled dropout for simplicity
+        dropout_rate=0.25,
         recurrent_dropout=0.15,
         use_attention=True
     )
@@ -1430,9 +1430,9 @@ if __name__ == "__main__":
         X_val=X_val,
         y_val=y_val,
         batch_size=64,
-        epochs=100,
-        patience=25,
-        min_delta=0.0001,
+        epochs=50,
+        patience=10,
+        min_delta=0.00005,
         horizon_weights=horizon_weights,
         model_path=str(model_path)
     )

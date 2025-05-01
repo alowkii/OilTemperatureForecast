@@ -1,18 +1,18 @@
 {
-    "mean_error": 3.7531380635454217,
-    "median_error": 3.1466883825683567,
-    "std_error": 3.4368387099583115,
-    "max_underestimation": 10.468463999999997,
-    "max_overestimation": -4.023654596191406,
-    "mean_abs_error": 4.154120969529371,
-    "median_abs_error": 3.2354798825683595,
-    "mean_pct_error": 7.623507167107951,
+    "mean_error": 24.105498303930037,
+    "median_error": 22.689093793457033,
+    "std_error": 2.9454266689728956,
+    "max_underestimation": 28.950829,
+    "max_overestimation": 20.42709718310547,
+    "mean_abs_error": 24.105498303930037,
+    "median_abs_error": 22.689093793457033,
+    "mean_pct_error": 49.83168208628988,
     "threshold_temperature": 46.64550018310547,
     "num_extreme_cases": 312,
     "extreme_metrics": {
-        "MAE": 4.154120969529371,
-        "RMSE": 5.085277486592081,
-        "MAPE": 8.47458326081246,
-        "R2": -13.455837293781462
+        "MAE": 24.105498303930037,
+        "RMSE": 24.284208460040272,
+        "MAPE": 49.831682086289874,
+        "R2": -328.6566524286087
     }
 }
