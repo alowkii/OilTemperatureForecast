@@ -1,6 +1,6 @@
 # Oil Temperature Forecasting Project
 
-[![Documentation](https://img.shields.io/badge/Documentation-Full_Docs-blue)](./documentation.md)
+[![Documentation](https://img.shields.io/badge/Documentation-Full_Docs-blue)](./Documentation.md)
 
 A machine learning system for predicting transformer oil temperature (OT) 24 hours in advance to help optimize energy distribution and prevent equipment damage.
 
