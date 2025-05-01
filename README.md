@@ -23,7 +23,7 @@ OilTempearatureForecast
 
 ## Pre-requisites
 
-This project is designed to be run in a Python 3.12.10 environment. It is recommended to use a virtual environment to avoid conflicts with other projects.
+This project is designed to be run in a Python 3.12.10 environment. It is recommended to use a virtual environment to avoid conflicts with other projects. "GPU is not required".
 
 Windows:
 
